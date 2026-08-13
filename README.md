@@ -10,7 +10,9 @@
 2. 授予摄像头权限。
 3. 应用锁定横屏。
 
-APK 输出名：`MultiCameraPreview_v1.0_debug.apk`。
+也可直接安装仓库里的 release 包：[`apk/MultiCameraPreview_v1.0_release.apk`](apk/MultiCameraPreview_v1.0_release.apk)。
+
+手动打 release 包：Android Studio 菜单 **Build → Generate Signed App Bundle or APK → APK**，选 release；或命令行在工程根目录执行 `gradlew.bat :app:assembleRelease`。成品在 `app/build/outputs/apk/release/MultiCameraPreview_v1.0_release.apk`。当前工程没有独立发布证书，release 使用 debug 签名，方便调试板安装。
 
 ## 窗口操作
 
