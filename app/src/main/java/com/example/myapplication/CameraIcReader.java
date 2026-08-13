@@ -94,9 +94,6 @@ public class CameraIcReader {
         return new IcType[] {
                 IcType.UNKNOWN,
                 IcType.TP9951,
-                IcType.TP9950,
-                IcType.TP2860,
-                IcType.TP2850,
                 IcType.TP2815,
                 IcType.TP2815_SUB,
                 IcType.LT6911C

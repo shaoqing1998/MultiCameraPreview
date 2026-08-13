@@ -2,11 +2,15 @@ package com.example.myapplication;
 
 import android.Manifest;
 import android.app.AlertDialog;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.InsetDrawable;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.opengl.GLSurfaceView;
@@ -15,9 +19,11 @@ import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.Size;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.TextureView;
 import android.view.View;
 import android.view.animation.DecelerateInterpolator;
+import android.widget.ArrayAdapter;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
@@ -25,12 +31,19 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class MainActivity extends AppCompatActivity
@@ -39,18 +52,25 @@ public class MainActivity extends AppCompatActivity
 
     private static final int REQUEST_CAMERA_PERMISSION = 100;
     private static final String TAG = "MainActivity";
+    private static final String PREFS_NAME = "camera_settings";
+    private static final String PREF_USE_OPENGL = "use_opengl_default";
+    private static final String PREF_SESSION = "session_state";
+    private static final String PREF_PANEL_PINNED = "panel_pinned";
 
     private FrameLayout container;
     private LinearLayout infoContent;
     private LinearLayout sidePanel;
-    private TextView togglePanel;
-
+    private TextView settingsBtn;
+    private TextView closePanelBtn;
+    private FrameLayout pinPanelBtn;
+    private PinIconView pinIcon;
+    private View panelScrim;
+    private boolean panelPinned = false;
     private CameraHelper cameraHelper;
     private Map<String, CameraFrame> cameraFrames = new HashMap<>();
     private Map<String, Boolean> cameraEnabled = new HashMap<>();
     private Map<String, CameraState> savedStates = new HashMap<>();
     private String[] cameraIds;
-
     private boolean isPanelVisible = false;
     private boolean isTunePanelVisible = false;
     private int screenWidth, screenHeight;
@@ -75,9 +95,11 @@ public class MainActivity extends AppCompatActivity
     private int currentAlgorithm = DeinterlaceRenderer.ALGO_WEAVE;
     private boolean currentDeinterlaceEnabled = false;
     private int currentPreset = -1;
-
     private String fullscreenCameraId = null;
     private CameraState fullscreenSavedState = null;
+    private int savedSystemUiVisibility;
+    private boolean useOpenGLByDefault = true;
+    private List<String> stackedCameraIds = new ArrayList<>();
 
     private int[] themeColors = {
             Color.parseColor("#7DA8C4"),
@@ -95,6 +117,25 @@ public class MainActivity extends AppCompatActivity
         float rotation;
         int fps;
         boolean deinterlaceEnabled;
+        boolean letterboxWhite;
+        boolean aspectLocked = true;
+        boolean oneToOneMode;
+        boolean deinterlacePresetActive;
+        boolean isNtsc = true;
+        int algorithm = DeinterlaceRenderer.ALGO_WEAVE;
+        boolean swapFields;
+        float blendFactor = 0.5f;
+        float motionThreshold = 0.08f;
+        float hOffset;
+        float hScale = 1f;
+        float sourceHeight = 503f;
+        float outputHeight = 480f;
+        float oddStart;
+        float oddLines = 240f;
+        float evenStart = 263f;
+        float evenLines = 240f;
+        String icOverride;
+        boolean deinterlaceParamsSaved;
 
         CameraState(float x, float y, int width, int height, Size resolution, float rotation, int fps) {
             this.x = x;
@@ -104,7 +145,8 @@ public class MainActivity extends AppCompatActivity
             this.resolution = resolution;
             this.rotation = rotation;
             this.fps = fps;
-            this.deinterlaceEnabled = true;
+            this.deinterlaceEnabled = false;
+            this.letterboxWhite = false;
         }
     }
 
@@ -119,30 +161,68 @@ public class MainActivity extends AppCompatActivity
         infoContent = findViewById(R.id.info_content);
         sidePanel = findViewById(R.id.side_panel);
         sidePanel.setBackgroundColor(COLOR_PANEL_BG);
+        sidePanel.setClickable(true);
+        sidePanel.setFocusable(true);
+        panelScrim = findViewById(R.id.panel_scrim);
+        settingsBtn = findViewById(R.id.settings_btn);
+        closePanelBtn = findViewById(R.id.close_panel);
+        pinPanelBtn = findViewById(R.id.pin_panel);
+        pinIcon = new PinIconView(this);
+        pinPanelBtn.addView(pinIcon, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
 
-        togglePanel = findViewById(R.id.toggle_panel);
-        GradientDrawable toggleBg = new GradientDrawable();
-        toggleBg.setColor(Color.parseColor("#404040"));
-        toggleBg.setCornerRadii(new float[]{8, 8, 0, 0, 0, 0, 8, 8});
-        togglePanel.setBackground(toggleBg);
-        togglePanel.setPadding(10, 24, 10, 24);
-        togglePanel.setText("<");
-        togglePanel.setTextSize(16);
-        togglePanel.setTextColor(COLOR_TEXT_PRIMARY);
+        GradientDrawable settingsBg = new GradientDrawable();
+        settingsBg.setColor(Color.parseColor("#404040"));
+        settingsBg.setCornerRadius(8);
+        settingsBtn.setBackground(settingsBg);
+
+        GradientDrawable closeBg = new GradientDrawable();
+        closeBg.setColor(Color.parseColor("#404040"));
+        closeBg.setCornerRadius(8);
+        closePanelBtn.setBackground(closeBg);
+
+        GradientDrawable pinBg = new GradientDrawable();
+        pinBg.setColor(Color.parseColor("#404040"));
+        pinBg.setCornerRadius(8);
+        pinPanelBtn.setBackground(pinBg);
+        updatePinButton();
 
         cameraHelper = new CameraHelper(this);
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        useOpenGLByDefault = prefs.getBoolean(PREF_USE_OPENGL, true);
+        panelPinned = prefs.getBoolean(PREF_PANEL_PINNED, false);
+        updatePinButton();
 
         DisplayMetrics metrics = new DisplayMetrics();
         getWindowManager().getDefaultDisplay().getMetrics(metrics);
         screenWidth = metrics.widthPixels;
         screenHeight = metrics.heightPixels;
 
-        sidePanel.post(() -> {
-            sidePanel.setTranslationX(sidePanel.getWidth());
-            isPanelVisible = false;
+        pinPanelBtn.setOnClickListener(v -> {
+            panelPinned = !panelPinned;
+            updatePinButton();
+            updatePanelScrim();
+            persistSettings();
+        });
+        settingsBtn.setOnClickListener(v -> setPanelVisible(true));
+        closePanelBtn.setOnClickListener(v -> setPanelVisible(false));
+        panelScrim.setOnClickListener(v -> {
+            if (!panelPinned) {
+                setPanelVisible(false);
+            }
         });
 
-        togglePanel.setOnClickListener(v -> onTogglePanelClick());
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                if (handleAppBack()) return;
+                setEnabled(false);
+                getOnBackPressedDispatcher().onBackPressed();
+                setEnabled(true);
+            }
+        });
 
         CameraIcReader.setHdmiAudio(true);
 
@@ -152,68 +232,88 @@ public class MainActivity extends AppCompatActivity
             requestCameraPermission();
         }
 
+        sidePanel.post(() -> {
+            if (panelPinned) {
+                isPanelVisible = false;
+                setPanelVisible(true);
+            } else {
+                sidePanel.setTranslationX(sidePanel.getWidth());
+                isPanelVisible = false;
+            }
+        });
+
         Log.d(TAG, CameraIcReader.getDebugInfo());
     }
 
-    private void onTogglePanelClick() {
+    private boolean handleAppBack() {
+        if (fullscreenCameraId != null) {
+            CameraFrame frame = cameraFrames.get(fullscreenCameraId);
+            if (frame != null) {
+                frame.setFullscreen(false);
+            }
+            return true;
+        }
         if (isTunePanelVisible) {
             hideTunePanel();
-        } else {
-            toggleSidePanel();
+            return true;
         }
+        if (isPanelVisible) {
+            setPanelVisible(false);
+            return true;
+        }
+        return false;
     }
 
-    private void toggleSidePanel() {
+    private void setPanelVisible(boolean visible) {
+        if (isPanelVisible == visible) return;
+        isPanelVisible = visible;
         int panelWidth = sidePanel.getWidth();
-        if (isPanelVisible) {
+        if (panelWidth <= 0) panelWidth = dp(340);
+        if (visible) {
+            updatePanelScrim();
+            settingsBtn.setVisibility(View.GONE);
+            sidePanel.animate()
+                    .translationX(0)
+                    .setDuration(ANIM_DURATION)
+                    .setInterpolator(new DecelerateInterpolator())
+                    .start();
+        } else {
+            panelScrim.setVisibility(View.GONE);
+            if (fullscreenCameraId == null) {
+                settingsBtn.setVisibility(View.VISIBLE);
+            }
             sidePanel.animate()
                     .translationX(panelWidth)
                     .setDuration(ANIM_DURATION)
                     .setInterpolator(new DecelerateInterpolator())
                     .start();
-            togglePanel.animate()
-                    .translationX(0)
-                    .setDuration(ANIM_DURATION)
-                    .setInterpolator(new DecelerateInterpolator())
-                    .withEndAction(() -> togglePanel.setText("<"))
-                    .start();
-            if (fullscreenCameraId != null) {
-                updateFullscreenLayout(false);
-            }
-        } else {
-            sidePanel.animate()
-                    .translationX(0)
-                    .setDuration(ANIM_DURATION)
-                    .setInterpolator(new DecelerateInterpolator())
-                    .start();
-            togglePanel.animate()
-                    .translationX(-panelWidth)
-                    .setDuration(ANIM_DURATION)
-                    .setInterpolator(new DecelerateInterpolator())
-                    .withEndAction(() -> togglePanel.setText(">"))
-                    .start();
-            if (fullscreenCameraId != null) {
-                updateFullscreenLayout(true);
-            }
         }
-        isPanelVisible = !isPanelVisible;
     }
 
-    private void updateFullscreenLayout(boolean panelVisible) {
-        if (fullscreenCameraId == null) return;
-        CameraFrame frame = cameraFrames.get(fullscreenCameraId);
-        if (frame == null) return;
+    private void updatePanelScrim() {
+        panelScrim.setVisibility(isPanelVisible && !panelPinned ? View.VISIBLE : View.GONE);
+    }
 
-        int availableWidth = panelVisible ? screenWidth - sidePanel.getWidth() : screenWidth;
-        int availableHeight = screenHeight;
+    private void updatePinButton() {
+        if (pinIcon != null) {
+            pinIcon.setPinned(panelPinned);
+        }
+    }
 
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                availableWidth - MARGIN * 2,
-                availableHeight - MARGIN * 2
-        );
-        frame.setLayoutParams(params);
-        frame.setX(MARGIN);
-        frame.setY(MARGIN);
+    private void setImmersiveFullscreen(boolean immersive) {
+        View decor = getWindow().getDecorView();
+        if (immersive) {
+            savedSystemUiVisibility = decor.getSystemUiVisibility();
+            decor.setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        } else {
+            decor.setSystemUiVisibility(savedSystemUiVisibility);
+        }
     }
 
     private boolean checkCameraPermission() {
@@ -248,9 +348,24 @@ public class MainActivity extends AppCompatActivity
         }
 
         calculateInitialLayouts();
+
         for (String id : cameraIds) {
             cameraEnabled.put(id, true);
         }
+        loadPersistedSettings();
+
+        // 打印每个摄像头所有支持的分辨率
+        for (String id : cameraIds) {
+            Size[] sizes = cameraHelper.getSupportedResolutions(id);
+            StringBuilder sb = new StringBuilder("Camera " + id + " supported sizes (" + (sizes != null ? sizes.length : 0) + "):");
+            if (sizes != null) {
+                for (Size s : sizes) {
+                    sb.append(" ").append(s.getWidth()).append("x").append(s.getHeight());
+                }
+            }
+            Log.d(TAG, sb.toString());
+        }
+
         updateInfoPanel();
         createCameraViews();
     }
@@ -281,6 +396,7 @@ public class MainActivity extends AppCompatActivity
                     x = (screenWidth - w) / 2f;
                     y = (screenHeight - h) / 2f;
                     break;
+
                 case 2:
                     int maxW = (screenWidth - MARGIN * 3) / 2;
                     int maxH = screenHeight - MARGIN * 2;
@@ -294,6 +410,7 @@ public class MainActivity extends AppCompatActivity
                     x = MARGIN + i * (maxW + MARGIN) + (maxW - w) / 2f;
                     y = MARGIN + (maxH - h) / 2f;
                     break;
+
                 case 3:
                     int maxW3 = (screenWidth - MARGIN * 3) / 2;
                     int maxH3 = (screenHeight - MARGIN * 3) / 2;
@@ -312,6 +429,7 @@ public class MainActivity extends AppCompatActivity
                         y = maxH3 + MARGIN * 2 + (maxH3 - h) / 2f;
                     }
                     break;
+
                 default:
                     int maxW4 = (screenWidth - MARGIN * 3) / 2;
                     int maxH4 = (screenHeight - MARGIN * 3) / 2;
@@ -332,7 +450,16 @@ public class MainActivity extends AppCompatActivity
                     y = MARGIN + row * (maxH4 + MARGIN) + (maxH4 - h) / 2f;
                     break;
             }
-            savedStates.put(cameraId, new CameraState(x, y, w, h, null, 0, 30));
+
+            CameraState st = savedStates.get(cameraId);
+            if (st == null) {
+                savedStates.put(cameraId, new CameraState(x, y, w, h, null, 0, 30));
+            } else {
+                st.x = x;
+                st.y = y;
+                st.width = w;
+                st.height = h;
+            }
         }
     }
 
@@ -348,6 +475,10 @@ public class MainActivity extends AppCompatActivity
         return sizes[0];
     }
 
+    private boolean isLegacy360Resolution(Size size) {
+        return size != null && size.getHeight() >= 4000;
+    }
+
     @Override
     public void onFullscreenChange(String cameraId, boolean isFullscreen) {
         CameraFrame frame = cameraFrames.get(cameraId);
@@ -360,17 +491,19 @@ public class MainActivity extends AppCompatActivity
                     null, 0, 0
             );
             fullscreenCameraId = cameraId;
+            setPanelVisible(false);
+            settingsBtn.setVisibility(View.GONE);
+            setImmersiveFullscreen(true);
 
-            int availableWidth = isPanelVisible ? screenWidth - sidePanel.getWidth() : screenWidth;
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                    availableWidth - MARGIN * 2,
-                    screenHeight - MARGIN * 2
-            );
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT);
             frame.setLayoutParams(params);
-            frame.setX(MARGIN);
-            frame.setY(MARGIN);
+            frame.setX(0);
+            frame.setY(0);
             frame.bringToFront();
         } else {
+            setImmersiveFullscreen(false);
             if (fullscreenSavedState != null) {
                 FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
                         fullscreenSavedState.width,
@@ -382,44 +515,65 @@ public class MainActivity extends AppCompatActivity
             }
             fullscreenCameraId = null;
             fullscreenSavedState = null;
+            settingsBtn.setVisibility(View.VISIBLE);
         }
     }
 
     private void showIcTypeSelectionDialog(String cameraId) {
         CameraIcReader.IcType[] types = CameraIcReader.getSelectableIcTypes();
         CameraIcReader.IcType currentType = CameraIcReader.getIcType(cameraId);
-        CameraIcReader.IcType originalType = CameraIcReader.getOriginalIcType(cameraId);
 
         String[] options = new String[types.length];
         int selectedIndex = 0;
+
         for (int i = 0; i < types.length; i++) {
             CameraIcReader.IcType type = types[i];
-            String label = type.name + " (" + type.displayName + ")";
-            if (type == originalType) {
-                label += " [自动检测]";
-            }
+            options[i] = type == CameraIcReader.IcType.UNKNOWN ? "无" : type.name;
             if (type == currentType) {
-                label += " ✓";
                 selectedIndex = i;
             }
-            options[i] = label;
         }
+
+        ArrayAdapter<String> icAdapter = new ArrayAdapter<>(this,
+                R.layout.dialog_choice_item, android.R.id.text1, options);
 
         new AlertDialog.Builder(this)
                 .setTitle("Camera " + cameraId + " - 选择 IC 类型")
-                .setSingleChoiceItems(options, selectedIndex, (dialog, which) -> {
+                .setSingleChoiceItems(icAdapter, selectedIndex, (dialog, which) -> {
                     CameraIcReader.IcType selectedType = types[which];
                     if (selectedType == CameraIcReader.IcType.UNKNOWN) {
                         CameraIcReader.clearManualIcType(cameraId);
                     } else {
                         CameraIcReader.setManualIcType(cameraId, selectedType);
                     }
-                    updateInfoPanel();
+                    Log.d(TAG, "IC changed: cam" + cameraId + " -> " + selectedType.name
+                            + " is360=" + CameraIcReader.is360Camera(cameraId)
+                            + " isHdmi=" + CameraIcReader.isHdmiCamera(cameraId));
+
                     if (cameraEnabled.getOrDefault(cameraId, false)) {
                         removeCameraView(cameraId);
+
+                        CameraState ss = savedStates.get(cameraId);
+                        if (ss != null) {
+                            ss.resolution = null;
+                        }
+                        cameraHelper.clearResolution(cameraId);
+
+                        if (CameraIcReader.isHdmiCamera(cameraId)) {
+                            Size res = cameraHelper.selectResolutionForHdmi(cameraId);
+                            cameraHelper.setResolution(cameraId, res);
+                            Log.d(TAG, "IC changed: pre-set HDMI resolution " + res);
+                        }
+
                         addCameraView(cameraId);
                     }
-                    Toast.makeText(this, "Camera " + cameraId + " IC 类型已设为: " + selectedType.displayName,
+
+                    // 5. 最后更新侧边栏（显示新的 IC 类型和按钮）
+                    updateInfoPanel();
+                    persistSettings();
+
+                    Toast.makeText(this, "Camera " + cameraId + " IC 类型已设为: "
+                                    + (selectedType == CameraIcReader.IcType.UNKNOWN ? "无" : selectedType.name),
                             Toast.LENGTH_SHORT).show();
                     dialog.dismiss();
                 })
@@ -430,18 +584,63 @@ public class MainActivity extends AppCompatActivity
     private void updateInfoPanel() {
         infoContent.removeAllViews();
 
+        LinearLayout glRow = new LinearLayout(this);
+        glRow.setOrientation(LinearLayout.HORIZONTAL);
+        glRow.setGravity(Gravity.CENTER_VERTICAL);
+        glRow.setPadding(14, 12, 14, 12);
+        glRow.setClipChildren(false);
+        glRow.setClipToPadding(false);
+        GradientDrawable glCardBg = new GradientDrawable();
+        glCardBg.setColor(COLOR_CARD_BG);
+        glCardBg.setCornerRadius(10);
+        glRow.setBackground(glCardBg);
+        LinearLayout.LayoutParams glRowParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        glRowParams.setMargins(0, 0, 0, 12);
+        glRow.setLayoutParams(glRowParams);
+
+        TextView glLabel = new TextView(this);
+        glLabel.setText("默认使用 OpenGL 打开");
+        glLabel.setTextColor(COLOR_TEXT_PRIMARY);
+        glLabel.setTextSize(15);
+        glLabel.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+
+        Switch glSwitch = new Switch(this);
+        LinearLayout.LayoutParams glSwitchParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        glSwitchParams.setMargins(8, 0, 0, 0);
+        glSwitch.setLayoutParams(glSwitchParams);
+        styleSwitch(glSwitch);
+        glSwitch.setChecked(useOpenGLByDefault);
+        glSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            useOpenGLByDefault = isChecked;
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(PREF_USE_OPENGL, isChecked)
+                    .apply();
+            recreateOpenGLAffectedCameras();
+            persistSettings();
+            Toast.makeText(this, isChecked ? "已切换为 OpenGL 打开" : "已切换为 TextureView 打开",
+                    Toast.LENGTH_SHORT).show();
+        });
+
+        glRow.addView(glLabel);
+        glRow.addView(glSwitch);
+        infoContent.addView(glRow);
+
         TextView countView = new TextView(this);
         countView.setText("共 " + cameraIds.length + " 个摄像头");
         countView.setTextColor(COLOR_TEXT_SECONDARY);
-        countView.setTextSize(12);
+        countView.setTextSize(14);
         countView.setPadding(0, 0, 0, 16);
         infoContent.addView(countView);
 
         try {
             CameraManager manager = (CameraManager) getSystemService(CAMERA_SERVICE);
+
             for (String id : cameraIds) {
                 CameraCharacteristics chars = manager.getCameraCharacteristics(id);
-                int color = themeColors[Integer.parseInt(id) % themeColors.length];
+                int color = themeColorFor(id);
 
                 LinearLayout camContainer = new LinearLayout(this);
                 camContainer.setOrientation(LinearLayout.VERTICAL);
@@ -462,11 +661,16 @@ public class MainActivity extends AppCompatActivity
                 TextView camTitle = new TextView(this);
                 camTitle.setText("Camera " + id);
                 camTitle.setTextColor(color);
-                camTitle.setTextSize(14);
+                camTitle.setTextSize(16);
                 camTitle.setTypeface(null, Typeface.BOLD);
                 camTitle.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
                 Switch toggle = new Switch(this);
+                LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                toggleParams.setMargins(8, 0, 0, 0);
+                toggle.setLayoutParams(toggleParams);
+                styleSwitch(toggle);
                 toggle.setChecked(cameraEnabled.getOrDefault(id, true));
                 final String camId = id;
                 toggle.setOnCheckedChangeListener((buttonView, isChecked) -> {
@@ -476,24 +680,48 @@ public class MainActivity extends AppCompatActivity
                     } else {
                         removeCameraView(camId);
                     }
+                    persistSettings();
                 });
 
                 headerRow.addView(camTitle);
                 headerRow.addView(toggle);
                 camContainer.addView(headerRow);
 
-                CameraIcReader.IcType icType = CameraIcReader.getIcType(id);
-                boolean hasOverride = CameraIcReader.hasManualOverride(id);
+                LinearLayout bgRow = new LinearLayout(this);
+                bgRow.setOrientation(LinearLayout.HORIZONTAL);
+                bgRow.setGravity(Gravity.CENTER_VERTICAL);
+                bgRow.setPadding(0, 8, 0, 4);
 
-                TextView icInfo = new TextView(this);
-                String icText = "IC: " + icType.displayName;
-                if (hasOverride) {
-                    icText += " (手动)";
-                }
-                if (CameraIcReader.needsDeinterlace(id)) {
-                    icText += " [交织]";
-                }
-                icInfo.setText(icText);
+                TextView bgLabel = new TextView(this);
+                bgLabel.setText("白底");
+                bgLabel.setTextColor(COLOR_TEXT_PRIMARY);
+                bgLabel.setTextSize(15);
+                bgLabel.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+
+                Switch bgSwitch = new Switch(this);
+                LinearLayout.LayoutParams bgSwitchParams = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                bgSwitchParams.setMargins(8, 0, 0, 0);
+                bgSwitch.setLayoutParams(bgSwitchParams);
+                styleSwitch(bgSwitch);
+                CameraFrame existingFrame = cameraFrames.get(camId);
+                CameraState savedBg = savedStates.get(camId);
+                boolean whiteOn = existingFrame != null ? existingFrame.isLetterboxWhite()
+                        : savedBg != null && savedBg.letterboxWhite;
+                bgSwitch.setChecked(whiteOn);
+                bgSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                    CameraState st = savedStates.get(camId);
+                    if (st != null) st.letterboxWhite = isChecked;
+                    CameraFrame f = cameraFrames.get(camId);
+                    if (f != null) f.setLetterboxWhite(isChecked);
+                    persistSettings();
+                });
+                bgRow.addView(bgLabel);
+                bgRow.addView(bgSwitch);
+                camContainer.addView(bgRow);
+
+                CameraIcReader.IcType icType = CameraIcReader.getIcType(id);
+
                 int icColor;
                 if (icType == CameraIcReader.IcType.LT6911C) {
                     icColor = COLOR_HDMI;
@@ -504,20 +732,32 @@ public class MainActivity extends AppCompatActivity
                 } else {
                     icColor = COLOR_360;
                 }
-                icInfo.setTextColor(icColor);
-                icInfo.setTextSize(11);
-                icInfo.setPadding(0, 6, 0, 0);
+
+                TextView icBtn = new TextView(this);
+                String icName = icType == CameraIcReader.IcType.UNKNOWN ? "无" : icType.name;
+                icBtn.setText(icName);
+                icBtn.setTextColor(Color.WHITE);
+                icBtn.setTextSize(20);
+                icBtn.setTypeface(null, Typeface.BOLD);
+                icBtn.setGravity(Gravity.CENTER);
+                icBtn.setPadding(16, 16, 16, 16);
+                icBtn.setMinHeight(52);
+                applyFilledButton(icBtn, Color.parseColor("#3A3A3A"), icColor);
+                LinearLayout.LayoutParams icBtnParams = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                icBtnParams.setMargins(0, 10, 0, 0);
+                icBtn.setLayoutParams(icBtnParams);
 
                 final String cameraId = id;
-                icInfo.setOnClickListener(v -> showIcTypeSelectionDialog(cameraId));
-                camContainer.addView(icInfo);
+                icBtn.setOnClickListener(v -> showIcTypeSelectionDialog(cameraId));
+                camContainer.addView(icBtn);
 
                 if (icType == CameraIcReader.IcType.UNKNOWN) {
                     TextView hintText = new TextView(this);
-                    hintText.setText("点击上方可手动选择IC类型");
+                    hintText.setText("未识别，点上方按钮手动选择");
                     hintText.setTextColor(COLOR_ACCENT);
-                    hintText.setTextSize(10);
-                    hintText.setPadding(0, 2, 0, 0);
+                    hintText.setTextSize(13);
+                    hintText.setPadding(0, 8, 0, 0);
                     camContainer.addView(hintText);
                 }
 
@@ -531,15 +771,13 @@ public class MainActivity extends AppCompatActivity
 
                 if (CameraIcReader.needsDeinterlace(id)) {
                     TextView deinterlaceBtn = new TextView(this);
-                    deinterlaceBtn.setText("De-interlace 调参");
+                    deinterlaceBtn.setText("参数");
                     deinterlaceBtn.setTextColor(Color.WHITE);
-                    deinterlaceBtn.setTextSize(12);
+                    deinterlaceBtn.setTextSize(15);
                     deinterlaceBtn.setGravity(Gravity.CENTER);
-                    deinterlaceBtn.setPadding(12, 10, 12, 10);
-                    GradientDrawable btnBg = new GradientDrawable();
-                    btnBg.setColor(COLOR_CVBS);
-                    btnBg.setCornerRadius(6);
-                    deinterlaceBtn.setBackground(btnBg);
+                    deinterlaceBtn.setPadding(16, 14, 16, 14);
+                    deinterlaceBtn.setMinHeight(48);
+                    applyFilledButton(deinterlaceBtn, COLOR_CVBS);
                     LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
                             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
                     btnParams.setMargins(0, 10, 0, 0);
@@ -560,20 +798,18 @@ public class MainActivity extends AppCompatActivity
                     TextView hdmiResView = new TextView(this);
                     hdmiResView.setText("HDMI: " + hdmiRes.getWidth() + "×" + hdmiRes.getHeight());
                     hdmiResView.setTextColor(CameraIcReader.isHdmiSignalValid() ? COLOR_360 : Color.parseColor("#C47D7D"));
-                    hdmiResView.setTextSize(11);
+                    hdmiResView.setTextSize(14);
                     hdmiResView.setPadding(0, 4, 0, 0);
                     camContainer.addView(hdmiResView);
 
                     TextView hdmiBtn = new TextView(this);
                     hdmiBtn.setText("HDMI 设置");
                     hdmiBtn.setTextColor(Color.WHITE);
-                    hdmiBtn.setTextSize(12);
+                    hdmiBtn.setTextSize(15);
                     hdmiBtn.setGravity(Gravity.CENTER);
-                    hdmiBtn.setPadding(12, 10, 12, 10);
-                    GradientDrawable hdmiBtnBg = new GradientDrawable();
-                    hdmiBtnBg.setColor(COLOR_HDMI);
-                    hdmiBtnBg.setCornerRadius(6);
-                    hdmiBtn.setBackground(hdmiBtnBg);
+                    hdmiBtn.setPadding(16, 14, 16, 14);
+                    hdmiBtn.setMinHeight(48);
+                    applyFilledButton(hdmiBtn, COLOR_HDMI);
                     LinearLayout.LayoutParams hdmiBtnParams = new LinearLayout.LayoutParams(
                             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
                     hdmiBtnParams.setMargins(0, 10, 0, 0);
@@ -582,35 +818,32 @@ public class MainActivity extends AppCompatActivity
                     camContainer.addView(hdmiBtn);
                 }
 
-                if (CameraIcReader.is360Camera(id)) {
-                    TextView settingsBtn = new TextView(this);
-                    settingsBtn.setText("360° 设置");
-                    settingsBtn.setTextColor(Color.WHITE);
-                    settingsBtn.setTextSize(12);
-                    settingsBtn.setGravity(Gravity.CENTER);
-                    settingsBtn.setPadding(12, 10, 12, 10);
-                    GradientDrawable btnBg = new GradientDrawable();
-                    btnBg.setColor(COLOR_360);
-                    btnBg.setCornerRadius(6);
-                    settingsBtn.setBackground(btnBg);
-                    LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
-                            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-                    btnParams.setMargins(0, 10, 0, 0);
-                    settingsBtn.setLayoutParams(btnParams);
-                    settingsBtn.setOnClickListener(v -> show360SettingsPanel(cameraId));
-                    camContainer.addView(settingsBtn);
-                }
-
                 infoContent.addView(camContainer);
             }
         } catch (Exception e) {
             e.printStackTrace();
         }
 
+        TextView resetLayoutBtn = new TextView(this);
+        resetLayoutBtn.setText("还原默认布局");
+        resetLayoutBtn.setTextColor(Color.WHITE);
+        resetLayoutBtn.setTextSize(16);
+        resetLayoutBtn.setGravity(Gravity.CENTER);
+        resetLayoutBtn.setPadding(16, 14, 16, 14);
+        resetLayoutBtn.setMinHeight(52);
+        applyFilledButton(resetLayoutBtn, Color.parseColor("#404040"));
+        applyPressFeedback(resetLayoutBtn);
+        LinearLayout.LayoutParams resetLayoutParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        resetLayoutParams.setMargins(0, 8, 0, 8);
+        resetLayoutBtn.setLayoutParams(resetLayoutParams);
+        resetLayoutBtn.setOnClickListener(v -> restoreDefaultLayouts());
+        infoContent.addView(resetLayoutBtn);
+
         TextView hint = new TextView(this);
-        hint.setText("\n操作提示:\n• 拖动标题栏移动\n• 右下角缩放\n• R 旋转画面\n• [ ] 全屏\n• 点击分辨率/帧率切换");
+        hint.setText("\n操作提示:\n• 点击画面显示/隐藏标题栏\n• 拖动标题栏或画面移动窗口\n• 右下角缩放，靠近边缘或其他窗口会吸附\n• 旋转按钮旋转画面，标题栏贴外框边\n• [ ] 全屏，再点画面退出\n• 点击分辨率/帧率切换");
         hint.setTextColor(COLOR_TEXT_SECONDARY);
-        hint.setTextSize(10);
+        hint.setTextSize(13);
         infoContent.addView(hint);
     }
 
@@ -618,17 +851,107 @@ public class MainActivity extends AppCompatActivity
         TextView tv = new TextView(this);
         tv.setText(text);
         tv.setTextColor(COLOR_TEXT_SECONDARY);
-        tv.setTextSize(11);
+        tv.setTextSize(14);
         tv.setPadding(0, 3, 0, 0);
         parent.addView(tv);
+    }
+
+    private void styleSwitch(Switch sw) {
+        sw.setShowText(false);
+        sw.setTextOn("");
+        sw.setTextOff("");
+        LinearLayout.LayoutParams params = sw.getLayoutParams() instanceof LinearLayout.LayoutParams
+                ? (LinearLayout.LayoutParams) sw.getLayoutParams()
+                : new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT);
+        params.width = LinearLayout.LayoutParams.WRAP_CONTENT;
+        params.height = LinearLayout.LayoutParams.WRAP_CONTENT;
+        params.gravity = Gravity.CENTER_VERTICAL;
+        sw.setLayoutParams(params);
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private void applyFilledButton(View view, int fillColor) {
+        applyFilledButton(view, fillColor, 0);
+    }
+
+    private void applyFilledButton(View view, int fillColor, int strokeColor) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(fillColor);
+        d.setCornerRadius(8);
+        if (strokeColor != 0) {
+            d.setStroke(2, strokeColor);
+        }
+        view.setBackground(d);
+    }
+
+    private void applyCompactChip(TextView view) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(Color.parseColor("#2E2E2E"));
+        d.setCornerRadius(dp(8));
+        int h = dp(4);
+        int v = dp(6);
+        view.setBackground(new InsetDrawable(d, h, v, h, v));
+        view.setPadding(0, 0, 0, 0);
+    }
+
+    private void applyPressFeedback(View view) {
+        view.setClickable(true);
+        view.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    v.animate().cancel();
+                    v.animate().scaleX(0.94f).scaleY(0.94f).alpha(0.78f).setDuration(70).start();
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    v.animate().cancel();
+                    v.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(90).start();
+                    break;
+            }
+            return false;
+        });
+    }
+
+    private TextView createBackButton() {
+        TextView backBtn = new TextView(this);
+        backBtn.setText("← 返回上级菜单");
+        backBtn.setTextColor(Color.WHITE);
+        backBtn.setTextSize(16);
+        backBtn.setGravity(Gravity.CENTER);
+        backBtn.setPadding(16, 14, 16, 14);
+        backBtn.setMinHeight(52);
+        LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        backParams.setMargins(0, 0, 0, 16);
+        backBtn.setLayoutParams(backParams);
+        applyFilledButton(backBtn, Color.parseColor("#404040"));
+        backBtn.setOnClickListener(v -> hideTunePanel());
+        return backBtn;
+    }
+
+    private void addSubPanelHeader(String title) {
+        infoContent.addView(createBackButton());
+
+        TextView titleView = new TextView(this);
+        titleView.setText(title);
+        titleView.setTextColor(Color.WHITE);
+        titleView.setTextSize(18);
+        titleView.setTypeface(null, Typeface.BOLD);
+        titleView.setPadding(0, 0, 0, 16);
+        infoContent.addView(titleView);
     }
 
     private void hideTunePanel() {
         isTunePanelVisible = false;
         currentTuneRenderer = null;
         currentTuneCameraId = null;
+        persistSettings();
         updateInfoPanel();
-        togglePanel.setText(">");
     }
 
     private LinearLayout createSeekBarWithButtons(String tag, int max, int progress,
@@ -640,11 +963,12 @@ public class MainActivity extends AppCompatActivity
         TextView minusBtn = new TextView(this);
         minusBtn.setText("－");
         minusBtn.setTextColor(COLOR_ACCENT);
-        minusBtn.setTextSize(16);
-        minusBtn.setPadding(16, 8, 16, 8);
+        minusBtn.setTextSize(22);
         minusBtn.setGravity(Gravity.CENTER);
-        minusBtn.setMinWidth(48);
-        minusBtn.setMinHeight(48);
+        minusBtn.setMinWidth(56);
+        minusBtn.setMinHeight(56);
+        applyCompactChip(minusBtn);
+        applyPressFeedback(minusBtn);
 
         SeekBar seekBar = new SeekBar(this);
         seekBar.setMax(max);
@@ -657,11 +981,12 @@ public class MainActivity extends AppCompatActivity
         TextView plusBtn = new TextView(this);
         plusBtn.setText("＋");
         plusBtn.setTextColor(COLOR_ACCENT);
-        plusBtn.setTextSize(16);
-        plusBtn.setPadding(16, 8, 16, 8);
+        plusBtn.setTextSize(22);
         plusBtn.setGravity(Gravity.CENTER);
-        plusBtn.setMinWidth(48);
-        plusBtn.setMinHeight(48);
+        plusBtn.setMinWidth(56);
+        plusBtn.setMinHeight(56);
+        applyCompactChip(plusBtn);
+        applyPressFeedback(plusBtn);
 
         minusBtn.setOnClickListener(v -> {
             int p = seekBar.getProgress();
@@ -670,7 +995,6 @@ public class MainActivity extends AppCompatActivity
                 listener.onProgressChanged(seekBar, p - 1, true);
             }
         });
-
         plusBtn.setOnClickListener(v -> {
             int p = seekBar.getProgress();
             if (p < seekBar.getMax()) {
@@ -682,7 +1006,6 @@ public class MainActivity extends AppCompatActivity
         row.addView(minusBtn);
         row.addView(seekBar);
         row.addView(plusBtn);
-
         return row;
     }
 
@@ -697,48 +1020,60 @@ public class MainActivity extends AppCompatActivity
         currentTuneCameraId = cameraId;
         isTunePanelVisible = true;
 
-        // 读取当前 renderer 的参数，不重置
         currentDeinterlaceEnabled = renderer.isDeinterlaceEnabled();
         currentAlgorithm = renderer.getAlgorithm();
-        currentPreset = -1;  // 预设状态不保存
-
-        togglePanel.setText("<-");
+        currentPreset = frame.isDeinterlacePresetActive() ? (frame.isNtsc() ? 0 : 1) : -1;
 
         infoContent.removeAllViews();
-
-        TextView titleView = new TextView(this);
-        titleView.setText("Cam " + cameraId + " De-interlace");
-        titleView.setTextColor(Color.WHITE);
-        titleView.setTextSize(16);
-        titleView.setTypeface(null, Typeface.BOLD);
-        titleView.setPadding(0, 0, 0, 16);
-        infoContent.addView(titleView);
+        addSubPanelHeader("Cam " + cameraId + " 参数");
 
         buildDeinterlaceTunePanelContent();
         updateTunePanelValues();
+        updateAlgoButtonStates();
+        updatePresetButtonStates();
     }
 
     private void resetDeinterlaceParams() {
-        if (currentTuneRenderer == null) return;
+        if (currentTuneRenderer == null || currentTuneCameraId == null) return;
 
-        currentTuneRenderer.setDeinterlaceEnabled(true);
-        currentTuneRenderer.setAlgorithm(DeinterlaceRenderer.ALGO_VERT_FILTER);
-        currentTuneRenderer.setSwapFields(true);  // 交换场序
-        currentTuneRenderer.setMotionThreshold(0.08f);
-        currentTuneRenderer.setHOffset(0.02f);
-        currentTuneRenderer.setHScale(0.98f);
-        currentTuneRenderer.setWhiteBackground(false);
-        currentTuneRenderer.setFrameParams(503, 480, 1, 238, 263, 238);
+        CameraFrame frame = cameraFrames.get(currentTuneCameraId);
+        Size original = frame != null ? frame.getDefaultCaptureResolution() : null;
+        if (original == null && frame != null) {
+            original = frame.getCurrentResolution();
+        }
+        boolean isNtsc = (original == null || original.getHeight() <= 503);
 
-        currentDeinterlaceEnabled = true;
-        currentAlgorithm = DeinterlaceRenderer.ALGO_VERT_FILTER;
-        currentPreset = 0;
+        if (original != null) {
+            Size current = frame.getCurrentResolution();
+            if (current == null
+                    || current.getWidth() != original.getWidth()
+                    || current.getHeight() != original.getHeight()) {
+                switchPresetResolution(currentTuneCameraId, original);
+            }
+        }
+
+        if (isNtsc) {
+            currentTuneRenderer.setNtscMode();
+        } else {
+            currentTuneRenderer.setPalMode();
+        }
+        currentTuneRenderer.setDeinterlaceEnabled(false);
+        if (frame != null) {
+            frame.setDeinterlaceEnabled(false);
+            frame.setNtscMode(isNtsc);
+            frame.setDeinterlacePresetActive(false);
+        }
+
+        currentDeinterlaceEnabled = false;
+        currentAlgorithm = currentTuneRenderer.getAlgorithm();
+        currentPreset = -1;
 
         updateTunePanelValues();
         updateAlgoButtonStates();
         updatePresetButtonStates();
 
         Toast.makeText(this, "参数已重置", Toast.LENGTH_SHORT).show();
+        persistSettings();
     }
 
     private void buildDeinterlaceTunePanelContent() {
@@ -749,13 +1084,11 @@ public class MainActivity extends AppCompatActivity
         TextView resetBtn = new TextView(this);
         resetBtn.setText("重置参数");
         resetBtn.setTextColor(Color.WHITE);
-        resetBtn.setTextSize(12);
+        resetBtn.setTextSize(16);
         resetBtn.setGravity(Gravity.CENTER);
-        resetBtn.setPadding(12, 10, 12, 10);
-        GradientDrawable resetBg = new GradientDrawable();
-        resetBg.setColor(COLOR_RESET);
-        resetBg.setCornerRadius(6);
-        resetBtn.setBackground(resetBg);
+        resetBtn.setPadding(16, 14, 16, 14);
+        resetBtn.setMinHeight(52);
+        applyFilledButton(resetBtn, COLOR_RESET);
         LinearLayout.LayoutParams resetParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         resetParams.setMargins(0, 0, 0, 16);
@@ -772,10 +1105,16 @@ public class MainActivity extends AppCompatActivity
         TextView swapLabel = new TextView(this);
         swapLabel.setText("交换场序");
         swapLabel.setTextColor(textColor);
+        swapLabel.setTextSize(16);
         swapLabel.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
         Switch swapSwitch = new Switch(this);
         swapSwitch.setTag("swapSwitch");
+        LinearLayout.LayoutParams swapSwitchParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        swapSwitchParams.setMargins(8, 0, 0, 0);
+        swapSwitch.setLayoutParams(swapSwitchParams);
+        styleSwitch(swapSwitch);
         swapSwitch.setOnCheckedChangeListener((b, c) -> {
             if (currentTuneRenderer != null) {
                 currentTuneRenderer.setSwapFields(c);
@@ -790,6 +1129,7 @@ public class MainActivity extends AppCompatActivity
         TextView presetTitle = new TextView(this);
         presetTitle.setText("\n预设:");
         presetTitle.setTextColor(COLOR_ACCENT);
+        presetTitle.setTextSize(16);
         presetTitle.setTypeface(null, Typeface.BOLD);
         infoContent.addView(presetTitle);
 
@@ -802,12 +1142,11 @@ public class MainActivity extends AppCompatActivity
             TextView btn = new TextView(this);
             btn.setText(presets[i]);
             btn.setTextColor(COLOR_ACCENT);
-            btn.setTextSize(11);
+            btn.setTextSize(14);
             btn.setGravity(Gravity.CENTER);
-            btn.setMinHeight(44);
-            btn.setPadding(12, 10, 12, 10);
+            btn.setMinHeight(52);
+            btn.setPadding(12, 12, 12, 12);
             btn.setTag("presetBtn_" + i);
-
             LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
                     0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
             btnParams.setMargins(2, 2, 2, 2);
@@ -817,17 +1156,25 @@ public class MainActivity extends AppCompatActivity
             btn.setOnClickListener(v -> {
                 if (currentTuneRenderer == null || currentTuneCameraId == null) return;
                 currentPreset = presetIdx;
-
+                CameraFrame frame = cameraFrames.get(currentTuneCameraId);
                 if (presetIdx == 0) {
                     currentTuneRenderer.setNtscMode();
                     switchPresetResolution(currentTuneCameraId, new Size(720, 503));
+                    if (frame != null) frame.setNtscMode(true);
                 } else {
                     currentTuneRenderer.setPalMode();
                     switchPresetResolution(currentTuneCameraId, new Size(720, 601));
+                    if (frame != null) frame.setNtscMode(false);
                 }
-
+                if (frame != null) {
+                    frame.setDeinterlaceEnabled(true);
+                    frame.setDeinterlacePresetActive(true);
+                }
+                currentDeinterlaceEnabled = true;
+                currentAlgorithm = currentTuneRenderer.getAlgorithm();
                 updatePresetButtonStates();
                 updateTunePanelValues();
+                updateAlgoButtonStates();
             });
             presetRow.addView(btn);
         }
@@ -837,6 +1184,7 @@ public class MainActivity extends AppCompatActivity
         TextView algoTitle = new TextView(this);
         algoTitle.setText("\n算法:");
         algoTitle.setTextColor(textColor);
+        algoTitle.setTextSize(16);
         infoContent.addView(algoTitle);
 
         LinearLayout algoContainer = new LinearLayout(this);
@@ -857,7 +1205,7 @@ public class MainActivity extends AppCompatActivity
 
         LinearLayout currentRow = null;
         for (int i = 0; i < algos.length; i++) {
-            if (i % 4 == 0) {
+            if (i % 2 == 0) {
                 currentRow = new LinearLayout(this);
                 currentRow.setOrientation(LinearLayout.HORIZONTAL);
                 algoContainer.addView(currentRow);
@@ -866,12 +1214,11 @@ public class MainActivity extends AppCompatActivity
             TextView btn = new TextView(this);
             btn.setText(algos[i]);
             btn.setTextColor(COLOR_ACCENT);
-            btn.setTextSize(10);
+            btn.setTextSize(15);
             btn.setGravity(Gravity.CENTER);
-            btn.setMinHeight(40);
-            btn.setPadding(6, 8, 6, 8);
+            btn.setMinHeight(52);
+            btn.setPadding(10, 12, 10, 12);
             btn.setTag("algoBtn_" + i);
-
             LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
                     0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
             btnParams.setMargins(1, 2, 1, 2);
@@ -891,10 +1238,8 @@ public class MainActivity extends AppCompatActivity
                 }
                 updateAlgoButtonStates();
             });
-
             currentRow.addView(btn);
         }
-
         infoContent.addView(algoContainer);
 
         // === 运动阈值 ===
@@ -918,12 +1263,13 @@ public class MainActivity extends AppCompatActivity
         TextView frameTitle = new TextView(this);
         frameTitle.setText("\n帧结构参数:");
         frameTitle.setTextColor(COLOR_ACCENT);
+        frameTitle.setTextSize(16);
         frameTitle.setTypeface(null, Typeface.BOLD);
         infoContent.addView(frameTitle);
 
         TextView paramsInfo = new TextView(this);
         paramsInfo.setTextColor(labelColor);
-        paramsInfo.setTextSize(10);
+        paramsInfo.setTextSize(14);
         paramsInfo.setTag("paramsInfo");
         infoContent.addView(paramsInfo);
 
@@ -982,7 +1328,7 @@ public class MainActivity extends AppCompatActivity
         };
         infoContent.addView(createSeekBarWithButtons("oddLinesSeek", 150, 40, oddLinesLabel, oddLinesListener));
 
-        // 偶场起始（独立设置）
+        // 偶场起始
         TextView evenStartLabel = new TextView(this);
         evenStartLabel.setText("偶场起始: 263");
         evenStartLabel.setTextColor(textColor);
@@ -1082,32 +1428,10 @@ public class MainActivity extends AppCompatActivity
         };
         infoContent.addView(createSeekBarWithButtons("hScaleSeek", 30, 30, hScaleLabel, hScaleListener));
 
-        // === 白色背景 ===
-        LinearLayout bgRow = new LinearLayout(this);
-        bgRow.setOrientation(LinearLayout.HORIZONTAL);
-        bgRow.setGravity(Gravity.CENTER_VERTICAL);
-        bgRow.setPadding(0, 16, 0, 8);
-
-        TextView bgLabel = new TextView(this);
-        bgLabel.setText("白色letterbox");
-        bgLabel.setTextColor(textColor);
-        bgLabel.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
-
-        Switch bgSwitch = new Switch(this);
-        bgSwitch.setTag("bgSwitch");
-        bgSwitch.setOnCheckedChangeListener((b, c) -> {
-            if (currentTuneRenderer != null) {
-                currentTuneRenderer.setWhiteBackground(c);
-            }
-            CameraFrame frame = cameraFrames.get(currentTuneCameraId);
-            if (frame != null) {
-                frame.setLetterboxWhite(c);
-            }
-        });
-
-        bgRow.addView(bgLabel);
-        bgRow.addView(bgSwitch);
-        infoContent.addView(bgRow);
+        TextView bottomBack = createBackButton();
+        LinearLayout.LayoutParams bottomParams = (LinearLayout.LayoutParams) bottomBack.getLayoutParams();
+        bottomParams.setMargins(0, 24, 0, 16);
+        infoContent.addView(bottomBack);
     }
 
     private void switchPresetResolution(String cameraId, Size newSize) {
@@ -1116,7 +1440,6 @@ public class MainActivity extends AppCompatActivity
 
         DeinterlaceRenderer renderer = frame.getDeinterlaceRenderer();
         GLSurfaceView glView = frame.getGLSurfaceView();
-
         if (renderer == null || glView == null) return;
 
         cameraHelper.closeCamera(cameraId);
@@ -1132,13 +1455,10 @@ public class MainActivity extends AppCompatActivity
 
     private void updatePresetButtonStates() {
         String[] presetNames = {"NTSC (720x503)", "PAL (720x601)"};
-
         for (int i = 0; i < 2; i++) {
             TextView btn = infoContent.findViewWithTag("presetBtn_" + i);
             if (btn == null) continue;
-
             boolean isSelected = (currentPreset == i);
-
             if (isSelected) {
                 btn.setTextColor(COLOR_SELECTED);
                 btn.setTypeface(null, Typeface.BOLD);
@@ -1167,14 +1487,12 @@ public class MainActivity extends AppCompatActivity
         for (int i = 0; i < algoVals.length; i++) {
             TextView btn = infoContent.findViewWithTag("algoBtn_" + i);
             if (btn == null) continue;
-
             boolean isSelected;
             if (algoVals[i] == -1) {
                 isSelected = !currentDeinterlaceEnabled;
             } else {
                 isSelected = currentDeinterlaceEnabled && currentAlgorithm == algoVals[i];
             }
-
             if (isSelected) {
                 btn.setTextColor(COLOR_SELECTED);
                 btn.setTypeface(null, Typeface.BOLD);
@@ -1192,9 +1510,6 @@ public class MainActivity extends AppCompatActivity
 
         currentDeinterlaceEnabled = currentTuneRenderer.isDeinterlaceEnabled();
         currentAlgorithm = currentTuneRenderer.getAlgorithm();
-
-        Switch bgSwitch = infoContent.findViewWithTag("bgSwitch");
-        if (bgSwitch != null) bgSwitch.setChecked(currentTuneRenderer.isWhiteBackground());
 
         Switch swapSwitch = infoContent.findViewWithTag("swapSwitch");
         if (swapSwitch != null) swapSwitch.setChecked(currentTuneRenderer.isSwapFields());
@@ -1232,7 +1547,7 @@ public class MainActivity extends AppCompatActivity
 
         TextView evenLinesLabel = infoContent.findViewWithTag("evenLinesLabel");
         if (evenLinesLabel != null) evenLinesLabel.setText("偶场行数: " + (int)currentTuneRenderer.getEvenLines());
-        // 更新标签文本
+
         TextView hOffsetLabel = infoContent.findViewWithTag("hOffsetLabel");
         if (hOffsetLabel != null) hOffsetLabel.setText("左边裁剪: " + (int)(currentTuneRenderer.getHOffset() * 100) + "%");
 
@@ -1241,7 +1556,6 @@ public class MainActivity extends AppCompatActivity
 
         TextView threshLabel = infoContent.findViewWithTag("threshLabel");
         if (threshLabel != null) threshLabel.setText("运动阈值: " + (int)(currentTuneRenderer.getMotionThreshold() * 100));
-
 
         updatePresetButtonStates();
         updateAlgoButtonStates();
@@ -1260,30 +1574,21 @@ public class MainActivity extends AppCompatActivity
 
     private void showHdmiSettingsPanel(String cameraId) {
         isTunePanelVisible = true;
-        togglePanel.setText("<-");
-
         infoContent.removeAllViews();
-
-        TextView titleView = new TextView(this);
-        titleView.setText("Cam " + cameraId + " HDMI 设置");
-        titleView.setTextColor(Color.WHITE);
-        titleView.setTextSize(16);
-        titleView.setTypeface(null, Typeface.BOLD);
-        titleView.setPadding(0, 0, 0, 16);
-        infoContent.addView(titleView);
+        addSubPanelHeader("Cam " + cameraId + " HDMI 设置");
 
         Size hdmiRes = CameraIcReader.getHdmiResolution();
         TextView resInfo = new TextView(this);
         resInfo.setText("当前 HDMI 输入: " + hdmiRes.getWidth() + "×" + hdmiRes.getHeight());
         resInfo.setTextColor(CameraIcReader.isHdmiSignalValid() ? COLOR_360 : COLOR_TEXT_SECONDARY);
-        resInfo.setTextSize(13);
+        resInfo.setTextSize(16);
         resInfo.setPadding(0, 8, 0, 16);
         infoContent.addView(resInfo);
 
         TextView signalInfo = new TextView(this);
         signalInfo.setText("信号状态: " + (CameraIcReader.isHdmiSignalValid() ? "有效" : "无信号"));
         signalInfo.setTextColor(CameraIcReader.isHdmiSignalValid() ? COLOR_360 : Color.parseColor("#C47D7D"));
-        signalInfo.setTextSize(12);
+        signalInfo.setTextSize(16);
         infoContent.addView(signalInfo);
 
         LinearLayout audioRow = new LinearLayout(this);
@@ -1294,10 +1599,15 @@ public class MainActivity extends AppCompatActivity
         TextView audioLabel = new TextView(this);
         audioLabel.setText("HDMI 音频");
         audioLabel.setTextColor(COLOR_TEXT_PRIMARY);
-        audioLabel.setTextSize(13);
+        audioLabel.setTextSize(16);
         audioLabel.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
         Switch audioSwitch = new Switch(this);
+        LinearLayout.LayoutParams audioSwitchParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        audioSwitchParams.setMargins(8, 0, 0, 0);
+        audioSwitch.setLayoutParams(audioSwitchParams);
+        styleSwitch(audioSwitch);
         audioSwitch.setChecked(CameraIcReader.isHdmiAudioEnabled());
         audioSwitch.setOnCheckedChangeListener((btn, checked) -> {
             boolean success = CameraIcReader.setHdmiAudio(checked);
@@ -1314,62 +1624,8 @@ public class MainActivity extends AppCompatActivity
         TextView hint = new TextView(this);
         hint.setText("\n提示:\nHDMI 采集依赖 LT6911C 芯片\n分辨率由输入源决定");
         hint.setTextColor(COLOR_TEXT_SECONDARY);
-        hint.setTextSize(11);
+        hint.setTextSize(14);
         infoContent.addView(hint);
-    }
-
-    private void show360SettingsPanel(String cameraId) {
-        isTunePanelVisible = true;
-        togglePanel.setText("<-");
-
-        infoContent.removeAllViews();
-
-        TextView titleView = new TextView(this);
-        titleView.setText("Cam " + cameraId + " 360° 设置");
-        titleView.setTextColor(Color.WHITE);
-        titleView.setTextSize(16);
-        titleView.setTypeface(null, Typeface.BOLD);
-        titleView.setPadding(0, 0, 0, 16);
-        infoContent.addView(titleView);
-
-        TextView imageTitle = new TextView(this);
-        imageTitle.setText("图像调节");
-        imageTitle.setTextColor(COLOR_ACCENT);
-        imageTitle.setTextSize(14);
-        imageTitle.setTypeface(null, Typeface.BOLD);
-        imageTitle.setPadding(0, 0, 0, 16);
-        infoContent.addView(imageTitle);
-
-        addSeekBarControlToPanel(infoContent, "亮度",
-                AwellCameraControl.CAM360_BRIGHTNESS,
-                AwellCameraControl.CAM360_MIN_BRIGHTNESS,
-                AwellCameraControl.CAM360_MAX_BRIGHTNESS);
-
-        addSeekBarControlToPanel(infoContent, "对比度",
-                AwellCameraControl.CAM360_CONTRAST,
-                AwellCameraControl.CAM360_MIN_CONTRAST,
-                AwellCameraControl.CAM360_MAX_CONTRAST);
-
-        addSeekBarControlToPanel(infoContent, "饱和度",
-                AwellCameraControl.CAM360_SATURATION,
-                AwellCameraControl.CAM360_MIN_SATURATION,
-                AwellCameraControl.CAM360_MAX_SATURATION);
-
-        TextView advTitle = new TextView(this);
-        advTitle.setText("\n高级设置");
-        advTitle.setTextColor(COLOR_HDMI);
-        advTitle.setTextSize(14);
-        advTitle.setTypeface(null, Typeface.BOLD);
-        advTitle.setPadding(0, 16, 0, 12);
-        infoContent.addView(advTitle);
-
-        if (AwellCameraControl.nodeExists(AwellCameraControl.CAM360_FORMAT)) {
-            addNodeRowToPanel(infoContent, "格式", AwellCameraControl.CAM360_FORMAT);
-        }
-
-        if (AwellCameraControl.nodeExists(AwellCameraControl.VIN_CHANNEL)) {
-            addNodeRowToPanel(infoContent, "VIN 通道", AwellCameraControl.VIN_CHANNEL);
-        }
     }
 
     private void addSeekBarControlToPanel(LinearLayout parent, String label,
@@ -1381,7 +1637,7 @@ public class MainActivity extends AppCompatActivity
         TextView labelView = new TextView(this);
         labelView.setText(label + ": " + currentVal);
         labelView.setTextColor(COLOR_TEXT_PRIMARY);
-        labelView.setTextSize(12);
+        labelView.setTextSize(16);
         labelView.setPadding(0, 8, 0, 4);
         parent.addView(labelView);
 
@@ -1392,10 +1648,8 @@ public class MainActivity extends AppCompatActivity
                 int newVal = progress + finalMinVal;
                 labelView.setText(label + ": " + newVal);
             }
-
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {}
-
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
                 int newVal = seekBar.getProgress() + finalMinVal;
@@ -1415,7 +1669,7 @@ public class MainActivity extends AppCompatActivity
         TextView labelView = new TextView(this);
         labelView.setText(label);
         labelView.setTextColor(COLOR_TEXT_PRIMARY);
-        labelView.setTextSize(12);
+        labelView.setTextSize(16);
         labelView.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         row.addView(labelView);
 
@@ -1423,16 +1677,16 @@ public class MainActivity extends AppCompatActivity
         TextView valueView = new TextView(this);
         valueView.setText(value != null ? value : "N/A");
         valueView.setTextColor(COLOR_ACCENT);
-        valueView.setTextSize(12);
+        valueView.setTextSize(16);
         valueView.setPadding(16, 0, 8, 0);
         row.addView(valueView);
 
         TextView editBtn = new TextView(this);
         editBtn.setText("Edit");
-        editBtn.setTextSize(12);
+        editBtn.setTextSize(16);
         editBtn.setTextColor(COLOR_TEXT_SECONDARY);
-        editBtn.setPadding(12, 8, 12, 8);
-        editBtn.setMinHeight(44);
+        editBtn.setPadding(16, 12, 16, 12);
+        editBtn.setMinHeight(52);
         editBtn.setGravity(Gravity.CENTER);
         editBtn.setOnClickListener(v -> showEditNodeDialog(nodeName, valueView));
         row.addView(editBtn);
@@ -1460,27 +1714,41 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void createCameraViews() {
-        for (String cameraId : cameraIds) {
-            if (!cameraEnabled.get(cameraId)) continue;
+        for (String cameraId : cameraAddOrder()) {
+            if (!cameraEnabled.getOrDefault(cameraId, true)) continue;
             addCameraView(cameraId);
         }
+    }
+
+    private List<String> cameraAddOrder() {
+        List<String> order = new ArrayList<>();
+        for (String id : stackedCameraIds) {
+            if (!order.contains(id)) order.add(id);
+        }
+        if (cameraIds != null) {
+            for (String id : cameraIds) {
+                if (!order.contains(id)) order.add(id);
+            }
+        }
+        return order;
     }
 
     private CameraFrame createCameraFrame(String cameraId) {
         CameraFrame frame = new CameraFrame(this);
         frame.setCameraId(cameraId);
-        frame.setThemeColor(themeColors[Integer.parseInt(cameraId) % themeColors.length]);
+        frame.setThemeColor(themeColorFor(cameraId));
         frame.setOnResolutionChangeListener(this);
         frame.setOnFpsChangeListener(this);
         frame.setOnFullscreenChangeListener(this);
 
         CameraState state = savedStates.get(cameraId);
-        if (state != null && state.resolution != null) {
-            cameraHelper.setResolution(cameraId, state.resolution);
-        } else if (CameraIcReader.isHdmiCamera(cameraId)) {
+        // IC 类型检测优先于 savedState，确保切换 IC 后分辨率正确
+        if (CameraIcReader.isHdmiCamera(cameraId)) {
             Size hdmiRes = cameraHelper.selectResolutionForHdmi(cameraId);
             cameraHelper.setResolution(cameraId, hdmiRes);
             Log.d(TAG, "HDMI Camera " + cameraId + " using resolution: " + hdmiRes);
+        } else if (state != null && state.resolution != null && !isLegacy360Resolution(state.resolution)) {
+            cameraHelper.setResolution(cameraId, state.resolution);
         }
 
         frame.setCurrentResolution(cameraHelper.getCurrentResolution(cameraId));
@@ -1495,25 +1763,33 @@ public class MainActivity extends AppCompatActivity
 
         if (CameraIcReader.needsDeinterlace(cameraId)) {
             Size res = cameraHelper.getCurrentResolution(cameraId);
-            boolean isNtsc = (res == null || res.getHeight() <= 503);
+            boolean isNtsc = state != null ? state.isNtsc : (res == null || res.getHeight() <= 503);
+
             frame.enableDeinterlaceMode(isNtsc);
 
-            // 默认关闭 de-interlace 处理
             DeinterlaceRenderer renderer = frame.getDeinterlaceRenderer();
             if (renderer != null) {
-                renderer.setDeinterlaceEnabled(false);
+                if (state != null && state.deinterlaceParamsSaved) {
+                    applyDeinterlaceState(renderer, state);
+                    frame.setDeinterlaceEnabled(state.deinterlaceEnabled);
+                    frame.setDeinterlacePresetActive(state.deinterlacePresetActive);
+                    frame.setNtscMode(state.isNtsc);
+                } else {
+                    renderer.setDeinterlaceEnabled(false);
+                    frame.setDeinterlaceEnabled(false);
+                }
             }
 
-            Log.d(TAG, "Camera " + cameraId + " de-interlace mode enabled (processing OFF by default), NTSC=" + isNtsc);
+            Log.d(TAG, "Camera " + cameraId + " de-interlace mode enabled, NTSC=" + isNtsc
+                    + " processing=" + (state != null && state.deinterlaceEnabled));
 
-            frame.setSurfaceReadyListener(surfaceTexture -> {
-                GLSurfaceView glView = frame.getGLSurfaceView();
-                if (glView != null) {
-                    cameraHelper.openCamera(cameraId, surfaceTexture, glView.getWidth(), glView.getHeight());
-                    frame.setCurrentResolution(cameraHelper.getCurrentResolution(cameraId));
-                    frame.hideLoading();
-                }
-            });
+            bindGlCamera(frame, cameraId);
+
+        } else if (useOpenGLByDefault) {
+            frame.enableOpenGLMode();
+            Log.d(TAG, "Camera " + cameraId + " OpenGL passthrough enabled");
+            bindGlCamera(frame, cameraId);
+
         } else {
             frame.getTextureView().setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
                 @Override
@@ -1522,21 +1798,75 @@ public class MainActivity extends AppCompatActivity
                     frame.setCurrentResolution(cameraHelper.getCurrentResolution(cameraId));
                     frame.hideLoading();
                 }
-
                 @Override
                 public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture s, int w, int h) {}
-
                 @Override
                 public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture s) {
                     return true;
                 }
-
                 @Override
                 public void onSurfaceTextureUpdated(@NonNull SurfaceTexture s) {}
             });
         }
 
+        if (state != null) {
+            frame.setLetterboxWhite(state.letterboxWhite);
+            frame.restoreViewFlags(state.aspectLocked, state.oneToOneMode);
+        }
+
         return frame;
+    }
+
+    private void applyDeinterlaceState(DeinterlaceRenderer renderer, CameraState state) {
+        if (state.deinterlacePresetActive) {
+            if (state.isNtsc) {
+                renderer.setNtscMode();
+            } else {
+                renderer.setPalMode();
+            }
+        }
+        renderer.setFrameParams(state.sourceHeight, state.outputHeight,
+                state.oddStart, state.oddLines, state.evenStart, state.evenLines);
+        renderer.setHOffset(state.hOffset);
+        renderer.setHScale(state.hScale);
+        renderer.setBlendFactor(state.blendFactor);
+        renderer.setMotionThreshold(state.motionThreshold);
+        renderer.setSwapFields(state.swapFields);
+        renderer.setAlgorithm(state.algorithm);
+        renderer.setDeinterlaceEnabled(state.deinterlaceEnabled);
+    }
+
+    private void bindGlCamera(CameraFrame frame, String cameraId) {
+        frame.setSurfaceReadyListener(surfaceTexture -> {
+            GLSurfaceView glView = frame.getGLSurfaceView();
+            if (glView != null) {
+                cameraHelper.openCamera(cameraId, surfaceTexture, glView.getWidth(), glView.getHeight());
+                frame.setCurrentResolution(cameraHelper.getCurrentResolution(cameraId));
+                frame.hideLoading();
+            }
+        });
+    }
+
+    private void recreateOpenGLAffectedCameras() {
+        if (cameraIds == null) return;
+        for (String id : cameraIds) {
+            if (!cameraEnabled.getOrDefault(id, false)) continue;
+            if (CameraIcReader.needsDeinterlace(id)) continue;
+            if (cameraFrames.containsKey(id)) {
+                removeCameraView(id);
+                addCameraView(id);
+            }
+        }
+    }
+
+    private int themeColorFor(String cameraId) {
+        int idx;
+        try {
+            idx = Integer.parseInt(cameraId);
+        } catch (NumberFormatException e) {
+            idx = Math.abs(cameraId.hashCode());
+        }
+        return themeColors[Math.floorMod(idx, themeColors.length)];
     }
 
     private void addCameraView(String cameraId) {
@@ -1550,6 +1880,7 @@ public class MainActivity extends AppCompatActivity
             frame.setX(state.x);
             frame.setY(state.y);
         }
+        frame.setOnGeometryChangeListener(f -> persistSettings());
 
         container.addView(frame);
         cameraFrames.put(cameraId, frame);
@@ -1558,19 +1889,7 @@ public class MainActivity extends AppCompatActivity
     private void removeCameraView(String cameraId) {
         CameraFrame frame = cameraFrames.remove(cameraId);
         if (frame != null) {
-            Size currentRes = cameraHelper.getCurrentResolution(cameraId);
-            CameraState state = new CameraState(
-                    frame.getX(),
-                    frame.getY(),
-                    frame.getWidth(),
-                    frame.getHeight(),
-                    currentRes,
-                    frame.getCurrentRotation(),
-                    frame.getCurrentFps()
-            );
-            state.deinterlaceEnabled = frame.isDeinterlaceEnabled();
-            savedStates.put(cameraId, state);
-
+            captureFrameState(cameraId, frame);
             cameraHelper.closeCamera(cameraId);
             frame.release();
             container.removeView(frame);
@@ -1589,10 +1908,9 @@ public class MainActivity extends AppCompatActivity
 
         CameraFrame frame = cameraFrames.get(cameraId);
         if (frame != null) {
-            if (frame.isDeinterlaceMode()) {
+            if (frame.isUsingGL()) {
                 DeinterlaceRenderer renderer = frame.getDeinterlaceRenderer();
                 GLSurfaceView glView = frame.getGLSurfaceView();
-
                 if (renderer != null && glView != null) {
                     SurfaceTexture surfaceTexture = renderer.getSurfaceTexture();
                     if (surfaceTexture != null) {
@@ -1616,6 +1934,7 @@ public class MainActivity extends AppCompatActivity
 
         Toast.makeText(this, "Camera " + cameraId + " → " +
                 newResolution.getWidth() + "×" + newResolution.getHeight(), Toast.LENGTH_SHORT).show();
+        persistSettings();
     }
 
     @Override
@@ -1627,10 +1946,12 @@ public class MainActivity extends AppCompatActivity
     public void onFpsChange(String cameraId, int newFps) {
         cameraHelper.updateFps(cameraId, newFps);
         Toast.makeText(this, "Camera " + cameraId + " → " + newFps + " fps", Toast.LENGTH_SHORT).show();
+        persistSettings();
     }
 
     @Override
     protected void onPause() {
+        persistSettings();
         super.onPause();
         for (CameraFrame frame : cameraFrames.values()) {
             frame.onPause();
@@ -1648,7 +1969,7 @@ public class MainActivity extends AppCompatActivity
             for (Map.Entry<String, CameraFrame> entry : cameraFrames.entrySet()) {
                 String cameraId = entry.getKey();
                 CameraFrame frame = entry.getValue();
-                if (frame.isDeinterlaceMode()) {
+                if (frame.isUsingGL()) {
                     // GLSurfaceView 会通过回调重新打开
                 } else {
                     TextureView tv = frame.getTextureView();
@@ -1668,5 +1989,293 @@ public class MainActivity extends AppCompatActivity
             frame.release();
         }
         cameraFrames.clear();
+    }
+
+    private void restoreDefaultLayouts() {
+        if (cameraIds == null) return;
+        if (fullscreenCameraId != null) {
+            CameraFrame fs = cameraFrames.get(fullscreenCameraId);
+            if (fs != null) fs.setFullscreen(false);
+        }
+        calculateInitialLayouts();
+        for (String id : cameraIds) {
+            CameraState st = savedStates.get(id);
+            if (st == null) continue;
+            st.rotation = 0;
+            st.oneToOneMode = false;
+            st.aspectLocked = true;
+            CameraFrame frame = cameraFrames.get(id);
+            if (frame == null) continue;
+            frame.restoreViewFlags(true, false);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(st.width, st.height);
+            frame.setLayoutParams(params);
+            frame.setX(st.x);
+            frame.setY(st.y);
+            frame.setCurrentRotation(0);
+        }
+        if (cameraIds != null) {
+            stackedCameraIds.clear();
+            for (String id : cameraIds) {
+                CameraFrame frame = cameraFrames.get(id);
+                if (frame != null) {
+                    frame.bringToFront();
+                    stackedCameraIds.add(id);
+                }
+            }
+        }
+        persistSettings();
+        Toast.makeText(this, "已还原默认布局", Toast.LENGTH_SHORT).show();
+    }
+
+    private CameraState ensureState(String cameraId) {
+        CameraState state = savedStates.get(cameraId);
+        if (state == null) {
+            state = new CameraState(0, 0, 320, 240, null, 0, 30);
+            savedStates.put(cameraId, state);
+        }
+        return state;
+    }
+
+    private void captureFrameState(String cameraId, CameraFrame frame) {
+        if (frame == null) return;
+        CameraState state = ensureState(cameraId);
+        boolean capturingFullscreen = cameraId.equals(fullscreenCameraId) || frame.isFullscreen();
+        if (!capturingFullscreen) {
+            int w = frame.getWidth();
+            int h = frame.getHeight();
+            if (w > 0 && h > 0) {
+                state.width = w;
+                state.height = h;
+                state.x = frame.getX();
+                state.y = frame.getY();
+            }
+        } else if (fullscreenSavedState != null && cameraId.equals(fullscreenCameraId)) {
+            state.x = fullscreenSavedState.x;
+            state.y = fullscreenSavedState.y;
+            state.width = fullscreenSavedState.width;
+            state.height = fullscreenSavedState.height;
+        }
+        state.rotation = frame.getCurrentRotation();
+        state.fps = frame.getCurrentFps();
+        state.letterboxWhite = frame.isLetterboxWhite();
+        state.aspectLocked = frame.isAspectLocked();
+        state.oneToOneMode = frame.isOneToOneMode();
+        Size res = cameraHelper.getCurrentResolution(cameraId);
+        if (res != null) state.resolution = res;
+        CameraIcReader.IcType manual = CameraIcReader.getManualIcType(cameraId);
+        state.icOverride = manual != null ? manual.name() : null;
+
+        if (CameraIcReader.needsDeinterlace(cameraId)) {
+            state.deinterlaceEnabled = frame.isDeinterlaceEnabled();
+            state.deinterlacePresetActive = frame.isDeinterlacePresetActive();
+            state.isNtsc = frame.isNtsc();
+            DeinterlaceRenderer renderer = frame.getDeinterlaceRenderer();
+            if (renderer != null) {
+                state.deinterlaceParamsSaved = true;
+                state.algorithm = renderer.getAlgorithm();
+                state.swapFields = renderer.isSwapFields();
+                state.blendFactor = renderer.getBlendFactor();
+                state.motionThreshold = renderer.getMotionThreshold();
+                state.hOffset = renderer.getHOffset();
+                state.hScale = renderer.getHScale();
+                state.sourceHeight = renderer.getSourceHeight();
+                state.outputHeight = renderer.getOutputHeight();
+                state.oddStart = renderer.getOddStart();
+                state.oddLines = renderer.getOddLines();
+                state.evenStart = renderer.getEvenStart();
+                state.evenLines = renderer.getEvenLines();
+                state.deinterlaceEnabled = renderer.isDeinterlaceEnabled();
+            }
+        }
+    }
+
+    private void persistSettings() {
+        SharedPreferences.Editor editor = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
+        editor.putBoolean(PREF_PANEL_PINNED, panelPinned);
+        if (cameraIds == null) {
+            editor.apply();
+            return;
+        }
+        for (Map.Entry<String, CameraFrame> entry : cameraFrames.entrySet()) {
+            captureFrameState(entry.getKey(), entry.getValue());
+        }
+        JSONObject root = new JSONObject();
+        try {
+            root.put("pin", panelPinned);
+            JSONArray zOrder = new JSONArray();
+            if (container != null) {
+                stackedCameraIds.clear();
+                for (int i = 0; i < container.getChildCount(); i++) {
+                    View child = container.getChildAt(i);
+                    if (child instanceof CameraFrame) {
+                        String id = ((CameraFrame) child).getCameraId();
+                        if (id != null) {
+                            stackedCameraIds.add(id);
+                            zOrder.put(id);
+                        }
+                    }
+                }
+            }
+            root.put("z", zOrder);
+            JSONObject cams = new JSONObject();
+            for (String id : cameraIds) {
+                CameraState st = savedStates.get(id);
+                if (st == null) continue;
+                JSONObject o = new JSONObject();
+                o.put("x", st.x);
+                o.put("y", st.y);
+                o.put("w", st.width);
+                o.put("h", st.height);
+                o.put("rot", st.rotation);
+                o.put("fps", st.fps);
+                o.put("enabled", cameraEnabled.getOrDefault(id, true));
+                o.put("white", st.letterboxWhite);
+                o.put("lock", st.aspectLocked);
+                o.put("one", st.oneToOneMode);
+                if (st.resolution != null) {
+                    o.put("rw", st.resolution.getWidth());
+                    o.put("rh", st.resolution.getHeight());
+                }
+                if (st.icOverride != null) {
+                    o.put("ic", st.icOverride);
+                }
+                if (st.deinterlaceParamsSaved) {
+                    o.put("de", st.deinterlaceEnabled);
+                    o.put("preset", st.deinterlacePresetActive);
+                    o.put("ntsc", st.isNtsc);
+                    o.put("algo", st.algorithm);
+                    o.put("swap", st.swapFields);
+                    o.put("blend", st.blendFactor);
+                    o.put("motion", st.motionThreshold);
+                    o.put("hoff", st.hOffset);
+                    o.put("hscale", st.hScale);
+                    o.put("srcH", st.sourceHeight);
+                    o.put("outH", st.outputHeight);
+                    o.put("oddS", st.oddStart);
+                    o.put("oddL", st.oddLines);
+                    o.put("evenS", st.evenStart);
+                    o.put("evenL", st.evenLines);
+                }
+                cams.put(id, o);
+            }
+            root.put("cameras", cams);
+            editor.putString(PREF_SESSION, root.toString());
+            editor.apply();
+        } catch (JSONException e) {
+            Log.e(TAG, "persistSettings failed", e);
+            editor.apply();
+        }
+    }
+
+    private void loadPersistedSettings() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String json = prefs.getString(PREF_SESSION, null);
+        if (json == null || json.isEmpty()) return;
+        try {
+            JSONObject root = new JSONObject(json);
+            panelPinned = root.optBoolean("pin", prefs.getBoolean(PREF_PANEL_PINNED, false));
+            updatePinButton();
+            stackedCameraIds.clear();
+            JSONArray zOrder = root.optJSONArray("z");
+            if (zOrder != null) {
+                for (int i = 0; i < zOrder.length(); i++) {
+                    String id = zOrder.optString(i, "");
+                    if (!id.isEmpty()) stackedCameraIds.add(id);
+                }
+            }
+            JSONObject cams = root.optJSONObject("cameras");
+            if (cams == null) return;
+            for (String id : cameraIds) {
+                JSONObject o = cams.optJSONObject(id);
+                if (o == null) continue;
+                CameraState st = ensureState(id);
+                st.x = (float) o.optDouble("x", st.x);
+                st.y = (float) o.optDouble("y", st.y);
+                st.width = o.optInt("w", st.width);
+                st.height = o.optInt("h", st.height);
+                st.rotation = (float) o.optDouble("rot", st.rotation);
+                st.fps = o.optInt("fps", st.fps);
+                st.letterboxWhite = o.optBoolean("white", st.letterboxWhite);
+                st.aspectLocked = o.optBoolean("lock", st.aspectLocked);
+                st.oneToOneMode = o.optBoolean("one", st.oneToOneMode);
+                int rw = o.optInt("rw", 0);
+                int rh = o.optInt("rh", 0);
+                if (rw > 0 && rh > 0 && rh < 4000) {
+                    st.resolution = new Size(rw, rh);
+                }
+                cameraEnabled.put(id, o.optBoolean("enabled", true));
+                String icName = o.optString("ic", "");
+                CameraIcReader.IcType ic = icTypeFromName(icName);
+                if (ic != null) {
+                    st.icOverride = ic.name();
+                    CameraIcReader.setManualIcType(id, ic);
+                }
+                if (o.has("algo")) {
+                    st.deinterlaceParamsSaved = true;
+                    st.deinterlaceEnabled = o.optBoolean("de", false);
+                    st.deinterlacePresetActive = o.optBoolean("preset", false);
+                    st.isNtsc = o.optBoolean("ntsc", true);
+                    st.algorithm = o.optInt("algo", DeinterlaceRenderer.ALGO_WEAVE);
+                    st.swapFields = o.optBoolean("swap", false);
+                    st.blendFactor = (float) o.optDouble("blend", 0.5);
+                    st.motionThreshold = (float) o.optDouble("motion", 0.08);
+                    st.hOffset = (float) o.optDouble("hoff", 0);
+                    st.hScale = (float) o.optDouble("hscale", 1);
+                    st.sourceHeight = (float) o.optDouble("srcH", 503);
+                    st.outputHeight = (float) o.optDouble("outH", 480);
+                    st.oddStart = (float) o.optDouble("oddS", 0);
+                    st.oddLines = (float) o.optDouble("oddL", 240);
+                    st.evenStart = (float) o.optDouble("evenS", 263);
+                    st.evenLines = (float) o.optDouble("evenL", 240);
+                }
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "loadPersistedSettings failed", e);
+        }
+    }
+
+    private CameraIcReader.IcType icTypeFromName(String name) {
+        if (name == null || name.isEmpty()) return null;
+        for (CameraIcReader.IcType type : CameraIcReader.IcType.values()) {
+            if (type.name().equals(name) || type.name.equals(name)) {
+                return type;
+            }
+        }
+        return null;
+    }
+
+    static class PinIconView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private boolean pinned;
+
+        PinIconView(android.content.Context context) {
+            super(context);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+        }
+
+        void setPinned(boolean pinned) {
+            this.pinned = pinned;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float s = Math.min(getWidth(), getHeight());
+            float cx = getWidth() / 2f;
+            float cy = getHeight() / 2f;
+            float stroke = Math.max(3f, s * 0.1f);
+            float headR = s * 0.16f;
+            float headY = cy - s * 0.10f;
+            float tipY = cy + s * 0.28f;
+
+            paint.setColor(pinned ? Color.parseColor("#7DA8C4") : Color.parseColor("#D4D4D4"));
+            paint.setStrokeWidth(stroke);
+            paint.setStyle(pinned ? Paint.Style.FILL : Paint.Style.STROKE);
+            canvas.drawCircle(cx, headY, headR, paint);
+            paint.setStyle(Paint.Style.STROKE);
+            canvas.drawLine(cx, headY + headR, cx, tipY, paint);
+        }
     }
 }

@@ -66,6 +66,23 @@ public class CameraHelper {
             StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             if (map != null) {
                 Size[] sizes = map.getOutputSizes(SurfaceTexture.class);
+                if (sizes == null) sizes = new Size[0];
+                // 额外查 high-resolution 列表（Camera2 可能把大尺寸放这里）
+                try {
+                    Size[] hiRes = map.getHighResolutionOutputSizes(android.graphics.ImageFormat.PRIVATE);
+                    if (hiRes != null && hiRes.length > 0) {
+                        Size[] merged = new Size[sizes.length + hiRes.length];
+                        System.arraycopy(sizes, 0, merged, 0, sizes.length);
+                        System.arraycopy(hiRes, 0, merged, sizes.length, hiRes.length);
+                        sizes = merged;
+                        Log.d(TAG, "Cam " + cameraId + " merged " + hiRes.length + " high-res sizes");
+                    }
+                } catch (Exception e) {
+                    // getHighResolutionOutputSizes 可能不支持 PRIVATE 格式
+                }
+                if (sizes.length == 0) {
+                    return new Size[]{new Size(640, 480)};
+                }
                 Arrays.sort(sizes, (a, b) -> b.getWidth() * b.getHeight() - a.getWidth() * a.getHeight());
                 return sizes;
             }
@@ -127,7 +144,6 @@ public class CameraHelper {
 
         Size bestMatch = null;
         int minDiff = Integer.MAX_VALUE;
-
         for (Size size : supportedSizes) {
             int diff = Math.abs(size.getWidth() - hdmiRes.getWidth()) +
                     Math.abs(size.getHeight() - hdmiRes.getHeight());
@@ -145,6 +161,96 @@ public class CameraHelper {
         return selectDefaultResolution(supportedSizes);
     }
 
+    /**
+     * 为 360 摄像头选择分辨率
+     * 选择 1920×4320 使 MDP 不缩放，App 直接收原始交织帧
+     */
+    public Size select360Resolution(String cameraId) {
+        Size[] sizes = getSupportedResolutions(cameraId);
+        // 打印所有支持的分辨率，便于调试
+        StringBuilder sb = new StringBuilder("360 cam " + cameraId + " supported sizes: ");
+        for (Size s : sizes) sb.append(s.getWidth()).append("x").append(s.getHeight()).append(", ");
+        Log.d(TAG, sb.toString());
+
+        // 优先: 精确匹配 1920×4320
+        for (Size size : sizes) {
+            if (size.getWidth() == 1920 && size.getHeight() == 4320) {
+                cameraResolutions.put(cameraId, size);
+                Log.d(TAG, "360 resolution exact: " + size);
+                return size;
+            }
+        }
+        // 次选: 宽 1920 且高 > 2000 的尺寸（可能是 1920×2160 等）
+        for (Size size : sizes) {
+            if (size.getWidth() == 1920 && size.getHeight() > 2000) {
+                cameraResolutions.put(cameraId, size);
+                Log.d(TAG, "360 resolution wide-tall: " + size);
+                return size;
+            }
+        }
+        // 退路：找 height > width*2 的尺寸
+        for (Size size : sizes) {
+            if (size.getHeight() > size.getWidth() * 2) {
+                cameraResolutions.put(cameraId, size);
+                Log.d(TAG, "360 resolution fallback tall: " + size);
+                return size;
+            }
+        }
+        // 最后退路: 最大分辨率
+        Size largest = sizes[0];
+        cameraResolutions.put(cameraId, largest);
+        Log.w(TAG, "No 360 resolution found, using largest: " + largest);
+        return largest;
+    }
+
+    /**
+     * 读取 HAL 传来的 360 通道交织顺序 (system property)
+     * HAL 在 flush_buffer 时读取前4行 TP2815 header，写入 vendor.cam.360.ch_order
+     * @return chMap[lineOffset] = channelNumber, 默认 {0,1,2,3}
+     */
+    public static int[] readChannelOrder() {
+        try {
+            String order = "0,1,2,3";
+            try {
+                Class<?> sp = Class.forName("android.os.SystemProperties");
+                java.lang.reflect.Method get = sp.getMethod("get", String.class, String.class);
+                order = (String) get.invoke(null, "vendor.cam.360.ch_order", "0,1,2,3");
+            } catch (Exception e) {
+                Log.w(TAG, "SystemProperties.get failed, using default", e);
+            }
+            String[] parts = order.split(",");
+            if (parts.length == 4) {
+                int[] map = new int[4];
+                for (int i = 0; i < 4; i++) {
+                    map[i] = Integer.parseInt(parts[i].trim());
+                }
+                Log.d(TAG, "360 ch_order from HAL: " + order);
+                return map;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "readChannelOrder failed", e);
+        }
+        return new int[]{0, 1, 2, 3};
+    }
+
+    /**
+     * 清除 HAL 的 360 通道顺序 property（IC 切换时调用，防止读到残留值）
+     */
+    public static void clearChannelOrder() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method set = sp.getMethod("set", String.class, String.class);
+            set.invoke(null, "vendor.cam.360.ch_order", "");
+            Log.d(TAG, "360 ch_order cleared");
+        } catch (Exception e) {
+            Log.w(TAG, "clearChannelOrder failed", e);
+        }
+    }
+
+    public void clearResolution(String cameraId) {
+        cameraResolutions.remove(cameraId);
+    }
+
     public void openCamera(String cameraId, SurfaceTexture surfaceTexture, int viewWidth, int viewHeight) {
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -157,6 +263,7 @@ public class CameraHelper {
             resolution = selectDefaultResolution(sizes);
             cameraResolutions.put(cameraId, resolution);
         }
+        Log.d(TAG, "openCamera " + cameraId + " resolution=" + resolution);
 
         // 默认帧率 30fps
         if (!cameraTargetFps.containsKey(cameraId)) {
@@ -261,9 +368,12 @@ public class CameraHelper {
     public void closeCamera(String cameraId) {
         CameraCaptureSession session = captureSessions.remove(cameraId);
         if (session != null) session.close();
+
         CameraDevice camera = openCameras.remove(cameraId);
         if (camera != null) camera.close();
+
         cameraSurfaces.remove(cameraId);
+        // 保留分辨率设置，避免切换分辨率/重开时被默认值覆盖
     }
 
     public void closeAllCameras() {
@@ -271,6 +381,7 @@ public class CameraHelper {
             session.close();
         }
         captureSessions.clear();
+
         for (CameraDevice camera : openCameras.values()) {
             camera.close();
         }
