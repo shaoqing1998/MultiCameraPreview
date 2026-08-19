@@ -443,6 +443,7 @@ public class DeinterlaceRenderer implements GLSurfaceView.Renderer, SurfaceTextu
     private FloatBuffer vertexBuffer, texCoordBuffer;
     private int programHandle, textureId;
     private SurfaceTexture surfaceTexture;
+    private volatile boolean released;
     private int aPositionLoc, aTexCoordLoc, uTextureLoc;
     private int uSrcHeightLoc, uOutHeightLoc;
     private int uOddStartLoc, uOddLinesLoc, uEvenStartLoc, uEvenLinesLoc;
@@ -504,10 +505,27 @@ public class DeinterlaceRenderer implements GLSurfaceView.Renderer, SurfaceTextu
     private boolean isNtscMode = true;
 
     private OnSurfaceReadyListener surfaceReadyListener;
+    private Runnable firstFrameListener;
+    private volatile boolean firstFrameNotified;
     private GLSurfaceView glSurfaceView;
 
     public interface OnSurfaceReadyListener {
         void onSurfaceReady(SurfaceTexture surfaceTexture);
+    }
+
+    public void setOnFirstFrameListener(Runnable listener) {
+        firstFrameListener = listener;
+    }
+
+    public void markReleased() {
+        released = true;
+        SurfaceTexture st = surfaceTexture;
+        if (st != null) {
+            try {
+                st.setOnFrameAvailableListener(null);
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     public DeinterlaceRenderer(GLSurfaceView view) { this(view, true); }
@@ -740,10 +758,17 @@ public class DeinterlaceRenderer implements GLSurfaceView.Renderer, SurfaceTextu
         if (needRebuildProgram) buildProgram();
 
         synchronized (lock) {
+            if (released) {
+                return;
+            }
             if (frameAvailable && surfaceTexture != null) {
-                surfaceTexture.updateTexImage();
-                surfaceTexture.getTransformMatrix(stMatrix);
-                stMatrixValid = true;
+                try {
+                    surfaceTexture.updateTexImage();
+                    surfaceTexture.getTransformMatrix(stMatrix);
+                    stMatrixValid = true;
+                } catch (Exception e) {
+                    Log.w(TAG, "updateTexImage failed", e);
+                }
                 frameAvailable = false;
                 // 调试: 每 100 帧打印纹理变换矩阵
                 if (mapReadCount % 100 == 0) {
@@ -885,7 +910,15 @@ public class DeinterlaceRenderer implements GLSurfaceView.Renderer, SurfaceTextu
 
     @Override
     public void onFrameAvailable(SurfaceTexture st) {
+        if (released) return;
         synchronized (lock) { frameAvailable = true; }
+        if (!firstFrameNotified) {
+            firstFrameNotified = true;
+            Runnable listener = firstFrameListener;
+            if (listener != null && glSurfaceView != null) {
+                glSurfaceView.post(listener);
+            }
+        }
         requestRender();
     }
 
@@ -1128,8 +1161,21 @@ public class DeinterlaceRenderer implements GLSurfaceView.Renderer, SurfaceTextu
     }
 
     public void release() {
+        released = true;
         synchronized (lock) {
-            if (surfaceTexture != null) { surfaceTexture.release(); surfaceTexture = null; }
+            if (surfaceTexture != null) {
+                try {
+                    surfaceTexture.setOnFrameAvailableListener(null);
+                } catch (Exception ignored) {
+                }
+                try {
+                    surfaceTexture.release();
+                } catch (Exception e) {
+                    Log.w(TAG, "SurfaceTexture.release failed", e);
+                }
+                surfaceTexture = null;
+            }
+            frameAvailable = false;
         }
     }
 }

@@ -10,6 +10,7 @@ import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.SystemClock;
 import android.opengl.GLSurfaceView;
 import android.util.Size;
 import android.util.TypedValue;
@@ -52,6 +53,17 @@ public class CameraFrame extends LinearLayout {
     private float resizeDownRawX, resizeDownRawY;
     private ProgressBar loadingSpinner;
     private LinearLayout loadingLayout;
+    private TextView loadingText;
+    private TextView openDurationText;
+    private long openStartElapsedMs;
+    private final Runnable loadingTick = new Runnable() {
+        @Override
+        public void run() {
+            if (loadingLayout == null || loadingLayout.getVisibility() != VISIBLE) return;
+            updateLoadingElapsed();
+            postDelayed(this, 100);
+        }
+    };
     private android.view.TextureView textureView;
 
     private String cameraId;
@@ -344,8 +356,8 @@ public class CameraFrame extends LinearLayout {
         LinearLayout.LayoutParams spinnerParams = new LinearLayout.LayoutParams(80, 80);
         loadingLayout.addView(loadingSpinner, spinnerParams);
 
-        TextView loadingText = new TextView(context);
-        loadingText.setText("加载中...");
+        loadingText = new TextView(context);
+        loadingText.setText("正在打开摄像头...");
         loadingText.setTextColor(COLOR_TEXT_SECONDARY);
         loadingText.setTextSize(14);
         loadingText.setGravity(Gravity.CENTER);
@@ -356,6 +368,24 @@ public class CameraFrame extends LinearLayout {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT);
         videoContainer.addView(loadingLayout, loadingParams);
+
+        openDurationText = new TextView(context);
+        openDurationText.setTextColor(Color.WHITE);
+        openDurationText.setTextSize(13);
+        openDurationText.setPadding(14, 8, 14, 8);
+        openDurationText.setVisibility(View.GONE);
+        GradientDrawable durationBg = new GradientDrawable();
+        durationBg.setColor(Color.parseColor("#CC1A1A1A"));
+        durationBg.setCornerRadius(8);
+        openDurationText.setBackground(durationBg);
+        FrameLayout.LayoutParams durationParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        durationParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        durationParams.setMargins(0, 0, 0, 16);
+        videoContainer.addView(openDurationText, durationParams);
+
+        startOpenTimer();
 
         touchLayer = new View(context);
         touchLayer.setClickable(true);
@@ -638,11 +668,8 @@ public class CameraFrame extends LinearLayout {
 
             aspectRatio = (float) getDeinterlaceOutputWidth() / getDeinterlaceOutputHeight();
 
+            teardownGlSurface();
             textureContainer.removeAllViews();
-            if (deinterlaceRenderer != null) {
-                deinterlaceRenderer.release();
-                deinterlaceRenderer = null;
-            }
 
             glSurfaceView = new GLSurfaceView(getContext());
             glSurfaceView.setEGLContextClientVersion(2);
@@ -685,11 +712,8 @@ public class CameraFrame extends LinearLayout {
             // 360 直通模式: 输出 2×2 网格 (3840×2160) = 16:9
             aspectRatio = 16.0f / 9.0f;
 
+            teardownGlSurface();
             textureContainer.removeAllViews();
-            if (deinterlaceRenderer != null) {
-                deinterlaceRenderer.release();
-                deinterlaceRenderer = null;
-            }
 
             glSurfaceView = new GLSurfaceView(getContext());
             glSurfaceView.setEGLContextClientVersion(2);
@@ -732,11 +756,8 @@ public class CameraFrame extends LinearLayout {
                 aspectRatio = (float) currentResolution.getWidth() / currentResolution.getHeight();
             }
 
+            teardownGlSurface();
             textureContainer.removeAllViews();
-            if (deinterlaceRenderer != null) {
-                deinterlaceRenderer.release();
-                deinterlaceRenderer = null;
-            }
 
             glSurfaceView = new GLSurfaceView(getContext());
             glSurfaceView.setEGLContextClientVersion(2);
@@ -770,23 +791,24 @@ public class CameraFrame extends LinearLayout {
     public void disableDeinterlaceMode() {
         useDeinterlace = false;
         openGLPassthrough = false;
-        if (deinterlaceRenderer != null) {
-            deinterlaceRenderer.release();
-            deinterlaceRenderer = null;
-        }
+        teardownGlSurface();
 
         textureContainer.removeAllViews();
         textureView = new android.view.TextureView(getContext());
         textureContainer.addView(textureView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
-
-        glSurfaceView = null;
     }
 
     public void setSurfaceReadyListener(DeinterlaceRenderer.OnSurfaceReadyListener listener) {
         if (deinterlaceRenderer != null) {
             deinterlaceRenderer.setOnSurfaceReadyListener(listener);
+        }
+    }
+
+    public void setOnFirstFrameListener(Runnable listener) {
+        if (deinterlaceRenderer != null) {
+            deinterlaceRenderer.setOnFirstFrameListener(listener);
         }
     }
 
@@ -891,6 +913,13 @@ public class CameraFrame extends LinearLayout {
     }
 
     public void hideLoading() {
+        boolean wasLoading = loadingLayout != null && loadingLayout.getVisibility() == VISIBLE;
+        removeCallbacks(loadingTick);
+        if (wasLoading) {
+            long ms = android.os.SystemClock.elapsedRealtime() - openStartElapsedMs;
+            android.util.Log.d("CameraFrame", "Camera " + cameraId + " opened in " + ms + "ms");
+            showOpenDuration(ms);
+        }
         if (loadingLayout != null) {
             loadingLayout.setVisibility(View.GONE);
         }
@@ -900,6 +929,45 @@ public class CameraFrame extends LinearLayout {
         if (loadingLayout != null) {
             loadingLayout.setVisibility(View.VISIBLE);
         }
+        if (openDurationText != null) {
+            openDurationText.setVisibility(View.GONE);
+            openDurationText.removeCallbacks(hideOpenDuration);
+        }
+        startOpenTimer();
+    }
+
+    private void startOpenTimer() {
+        openStartElapsedMs = SystemClock.elapsedRealtime();
+        updateLoadingElapsed();
+        removeCallbacks(loadingTick);
+        post(loadingTick);
+    }
+
+    private void updateLoadingElapsed() {
+        if (loadingText == null) return;
+        loadingText.setText("正在打开摄像头...\n" + formatOpenDuration(
+                SystemClock.elapsedRealtime() - openStartElapsedMs));
+    }
+
+    private void showOpenDuration(long ms) {
+        if (openDurationText == null) return;
+        openDurationText.setText("打开耗时 " + formatOpenDuration(ms));
+        openDurationText.setVisibility(View.VISIBLE);
+        openDurationText.removeCallbacks(hideOpenDuration);
+        openDurationText.postDelayed(hideOpenDuration, 4000);
+    }
+
+    private final Runnable hideOpenDuration = () -> {
+        if (openDurationText != null) {
+            openDurationText.setVisibility(View.GONE);
+        }
+    };
+
+    private static String formatOpenDuration(long ms) {
+        if (ms < 1000) {
+            return ms + "ms";
+        }
+        return String.format(java.util.Locale.US, "%.2fs", ms / 1000f);
     }
 
     private static class RotateIconView extends View {
@@ -1423,10 +1491,45 @@ public class CameraFrame extends LinearLayout {
         }
     }
 
-    public void release() {
-        if (deinterlaceRenderer != null) {
-            deinterlaceRenderer.release();
+    /**
+     * Stop drawing immediately, release SurfaceTexture on the GL thread,
+     * and pause EGL without blocking the UI thread.
+     */
+    private void teardownGlSurface() {
+        GLSurfaceView glView = glSurfaceView;
+        DeinterlaceRenderer renderer = deinterlaceRenderer;
+        glSurfaceView = null;
+        deinterlaceRenderer = null;
+        if (renderer != null) {
+            renderer.markReleased();
+            if (glView != null) {
+                try {
+                    glView.queueEvent(renderer::release);
+                } catch (Exception e) {
+                    android.util.Log.w("CameraFrame", "queueEvent release failed", e);
+                    renderer.release();
+                }
+            } else {
+                renderer.release();
+            }
         }
+        if (glView != null) {
+            glView.post(() -> {
+                try {
+                    glView.onPause();
+                } catch (Exception e) {
+                    android.util.Log.e("CameraFrame", "GLSurfaceView.onPause failed", e);
+                }
+            });
+        }
+    }
+
+    public void release() {
+        removeCallbacks(loadingTick);
+        if (openDurationText != null) {
+            openDurationText.removeCallbacks(hideOpenDuration);
+        }
+        teardownGlSurface();
     }
 
     @Override

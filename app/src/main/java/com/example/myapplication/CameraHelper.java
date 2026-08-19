@@ -13,6 +13,7 @@ import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
@@ -24,7 +25,9 @@ import androidx.core.app.ActivityCompat;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 public class CameraHelper {
     private static final String TAG = "CameraHelper";
@@ -36,8 +39,26 @@ public class CameraHelper {
     private Map<String, Size> cameraResolutions = new HashMap<>();
     private Map<String, Integer> cameraTargetFps = new HashMap<>();  // 目标帧率
     private Map<String, Surface> cameraSurfaces = new HashMap<>();   // 保存 Surface 用于重启
+    private final Map<String, Surface> closingSurfaces = new HashMap<>();
+    private final Object cameraLock = new Object();
+    private final Set<String> closingIds = new HashSet<>();
+    private final Map<String, PendingOpen> pendingOpens = new HashMap<>();
+    private final Map<String, Size[]> resolutionCache = new HashMap<>();
+    private final Map<String, Integer> facingCache = new HashMap<>();
     private Handler backgroundHandler;
     private HandlerThread backgroundThread;
+
+    private static class PendingOpen {
+        final SurfaceTexture surfaceTexture;
+        final int viewWidth;
+        final int viewHeight;
+
+        PendingOpen(SurfaceTexture surfaceTexture, int viewWidth, int viewHeight) {
+            this.surfaceTexture = surfaceTexture;
+            this.viewWidth = viewWidth;
+            this.viewHeight = viewHeight;
+        }
+    }
 
     public CameraHelper(Context context) {
         this.context = context;
@@ -51,6 +72,47 @@ public class CameraHelper {
         backgroundHandler = new Handler(backgroundThread.getLooper());
     }
 
+    private void runOnCameraThread(Runnable work) {
+        if (backgroundHandler == null) {
+            work.run();
+            return;
+        }
+        if (Looper.myLooper() == backgroundHandler.getLooper()) {
+            work.run();
+        } else {
+            backgroundHandler.post(work);
+        }
+    }
+
+    public Size[] getCachedResolutions(String cameraId) {
+        synchronized (cameraLock) {
+            return resolutionCache.get(cameraId);
+        }
+    }
+
+    public Integer getCachedLensFacing(String cameraId) {
+        synchronized (cameraLock) {
+            return facingCache.get(cameraId);
+        }
+    }
+
+    public void prefetchCameraInfo(String[] ids, Runnable onDone) {
+        runOnCameraThread(() -> {
+            if (ids != null) {
+                for (String id : ids) {
+                    try {
+                        getSupportedResolutions(id);
+                    } catch (Exception e) {
+                        Log.w(TAG, "prefetchCameraInfo " + id, e);
+                    }
+                }
+            }
+            if (onDone != null) {
+                onDone.run();
+            }
+        });
+    }
+
     public String[] getCameraIdList() {
         try {
             return cameraManager.getCameraIdList();
@@ -61,8 +123,26 @@ public class CameraHelper {
     }
 
     public Size[] getSupportedResolutions(String cameraId) {
+        synchronized (cameraLock) {
+            Size[] cached = resolutionCache.get(cameraId);
+            if (cached != null) return cached;
+        }
+        Size[] sizes = querySupportedResolutions(cameraId);
+        synchronized (cameraLock) {
+            resolutionCache.put(cameraId, sizes);
+        }
+        return sizes;
+    }
+
+    private Size[] querySupportedResolutions(String cameraId) {
         try {
             CameraCharacteristics chars = cameraManager.getCameraCharacteristics(cameraId);
+            Integer facing = chars.get(CameraCharacteristics.LENS_FACING);
+            if (facing != null) {
+                synchronized (cameraLock) {
+                    facingCache.put(cameraId, facing);
+                }
+            }
             StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             if (map != null) {
                 Size[] sizes = map.getOutputSizes(SurfaceTexture.class);
@@ -86,7 +166,7 @@ public class CameraHelper {
                 Arrays.sort(sizes, (a, b) -> b.getWidth() * b.getHeight() - a.getWidth() * a.getHeight());
                 return sizes;
             }
-        } catch (CameraAccessException e) {
+        } catch (Exception e) {
             Log.e(TAG, "getSupportedResolutions: ", e);
         }
         return new Size[]{new Size(640, 480)};
@@ -256,8 +336,42 @@ public class CameraHelper {
                 != PackageManager.PERMISSION_GRANTED) {
             return;
         }
+        if (surfaceTexture == null) {
+            Log.w(TAG, "openCamera skipped, null SurfaceTexture " + cameraId);
+            return;
+        }
+        runOnCameraThread(() -> openCameraInternal(cameraId, surfaceTexture, viewWidth, viewHeight));
+    }
+
+    private void openCameraInternal(String cameraId, SurfaceTexture surfaceTexture, int viewWidth, int viewHeight) {
+        if (surfaceTexture == null) {
+            Log.w(TAG, "openCamera skipped, null SurfaceTexture " + cameraId);
+            return;
+        }
+
+        boolean defer;
+        synchronized (cameraLock) {
+            defer = closingIds.contains(cameraId) || openCameras.containsKey(cameraId);
+            if (defer) {
+                pendingOpens.put(cameraId, new PendingOpen(surfaceTexture, viewWidth, viewHeight));
+                Log.d(TAG, "openCamera deferred until close " + cameraId);
+                if (openCameras.containsKey(cameraId) && !closingIds.contains(cameraId)) {
+                    // already open: close first, reopen in onClosed
+                } else {
+                    return;
+                }
+            }
+        }
+        if (defer) {
+            closeCameraInternal(cameraId);
+            return;
+        }
 
         Size resolution = cameraResolutions.get(cameraId);
+        if (resolution == null && CameraIcReader.isHdmiCamera(cameraId)) {
+            resolution = selectResolutionForHdmi(cameraId);
+            cameraResolutions.put(cameraId, resolution);
+        }
         if (resolution == null) {
             Size[] sizes = getSupportedResolutions(cameraId);
             resolution = selectDefaultResolution(sizes);
@@ -273,29 +387,116 @@ public class CameraHelper {
         try {
             surfaceTexture.setDefaultBufferSize(resolution.getWidth(), resolution.getHeight());
             final Surface surface = new Surface(surfaceTexture);
-            cameraSurfaces.put(cameraId, surface);
+            synchronized (cameraLock) {
+                cameraSurfaces.put(cameraId, surface);
+            }
 
             cameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(@NonNull CameraDevice camera) {
-                    openCameras.put(cameraId, camera);
+                    synchronized (cameraLock) {
+                        openCameras.put(cameraId, camera);
+                    }
                     createCaptureSession(cameraId, camera, surface);
                 }
 
                 @Override
                 public void onDisconnected(@NonNull CameraDevice camera) {
-                    camera.close();
-                    openCameras.remove(cameraId);
+                    Log.w(TAG, "onDisconnected " + cameraId);
+                    closeDeviceIfCurrent(cameraId, camera);
                 }
 
                 @Override
                 public void onError(@NonNull CameraDevice camera, int error) {
-                    camera.close();
-                    openCameras.remove(cameraId);
+                    Log.e(TAG, "onError " + cameraId + " error=" + error);
+                    closeDeviceIfCurrent(cameraId, camera);
+                }
+
+                @Override
+                public void onClosed(@NonNull CameraDevice camera) {
+                    Surface oldSurface;
+                    synchronized (cameraLock) {
+                        closingIds.remove(cameraId);
+                        if (openCameras.get(cameraId) == camera) {
+                            openCameras.remove(cameraId);
+                        }
+                        oldSurface = closingSurfaces.remove(cameraId);
+                    }
+                    if (oldSurface != null) {
+                        try {
+                            oldSurface.release();
+                        } catch (Exception e) {
+                            Log.w(TAG, "surface.release onClosed " + cameraId, e);
+                        }
+                    }
+                    openPendingIfAny(cameraId);
                 }
             }, backgroundHandler);
-        } catch (CameraAccessException e) {
+        } catch (Exception e) {
             Log.e(TAG, "openCamera: ", e);
+        }
+    }
+
+    private void closeDeviceIfCurrent(String cameraId, CameraDevice camera) {
+        boolean shouldClose = false;
+        CameraCaptureSession session;
+        synchronized (cameraLock) {
+            session = captureSessions.remove(cameraId);
+            if (openCameras.get(cameraId) == camera) {
+                openCameras.remove(cameraId);
+                closingIds.add(cameraId);
+                shouldClose = true;
+                Surface s = cameraSurfaces.remove(cameraId);
+                if (s != null) {
+                    closingSurfaces.put(cameraId, s);
+                }
+            }
+        }
+        if (session != null) {
+            try {
+                session.close();
+            } catch (Exception e) {
+                Log.w(TAG, "session.close in callback " + cameraId, e);
+            }
+        }
+        if (shouldClose) {
+            try {
+                camera.close();
+            } catch (Exception e) {
+                Log.w(TAG, "camera.close in callback " + cameraId, e);
+                releaseClosingSurface(cameraId);
+                synchronized (cameraLock) {
+                    closingIds.remove(cameraId);
+                }
+                openPendingIfAny(cameraId);
+            }
+        }
+    }
+
+    private void releaseClosingSurface(String cameraId) {
+        Surface oldSurface;
+        synchronized (cameraLock) {
+            oldSurface = closingSurfaces.remove(cameraId);
+        }
+        if (oldSurface != null) {
+            try {
+                oldSurface.release();
+            } catch (Exception e) {
+                Log.w(TAG, "surface.release " + cameraId, e);
+            }
+        }
+    }
+
+    private void openPendingIfAny(String cameraId) {
+        PendingOpen pending;
+        synchronized (cameraLock) {
+            if (closingIds.contains(cameraId) || openCameras.containsKey(cameraId)) {
+                return;
+            }
+            pending = pendingOpens.remove(cameraId);
+        }
+        if (pending != null) {
+            openCamera(cameraId, pending.surfaceTexture, pending.viewWidth, pending.viewHeight);
         }
     }
 
@@ -326,7 +527,7 @@ public class CameraHelper {
                             Log.e(TAG, "onConfigureFailed: " + cameraId);
                         }
                     }, backgroundHandler);
-        } catch (CameraAccessException e) {
+        } catch (Exception e) {
             Log.e(TAG, "createCaptureSession: ", e);
         }
     }
@@ -345,7 +546,16 @@ public class CameraHelper {
             Log.d(TAG, "Camera " + cameraId + " preview with FPS: " + targetFps);
 
             session.setRepeatingRequest(builder.build(), null, backgroundHandler);
-        } catch (CameraAccessException e) {
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "startPreview FPS unsupported, retry without: " + cameraId, e);
+            try {
+                CaptureRequest.Builder fallback = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                fallback.addTarget(surface);
+                session.setRepeatingRequest(fallback.build(), null, backgroundHandler);
+            } catch (Exception retry) {
+                Log.e(TAG, "startPreview fallback: ", retry);
+            }
+        } catch (Exception e) {
             Log.e(TAG, "startPreview: ", e);
         }
     }
@@ -366,27 +576,108 @@ public class CameraHelper {
     }
 
     public void closeCamera(String cameraId) {
-        CameraCaptureSession session = captureSessions.remove(cameraId);
-        if (session != null) session.close();
+        runOnCameraThread(() -> closeCameraInternal(cameraId));
+    }
 
-        CameraDevice camera = openCameras.remove(cameraId);
-        if (camera != null) camera.close();
+    private void closeCameraInternal(String cameraId) {
+        CameraCaptureSession session;
+        CameraDevice camera;
+        synchronized (cameraLock) {
+            session = captureSessions.remove(cameraId);
+            camera = openCameras.remove(cameraId);
+            Surface surface = cameraSurfaces.remove(cameraId);
+            if (camera != null || session != null) {
+                closingIds.add(cameraId);
+            }
+            if (surface != null) {
+                closingSurfaces.put(cameraId, surface);
+            }
+        }
 
-        cameraSurfaces.remove(cameraId);
+        if (session != null) {
+            try {
+                session.stopRepeating();
+            } catch (Exception e) {
+                Log.w(TAG, "stopRepeating " + cameraId, e);
+            }
+            try {
+                session.close();
+            } catch (Exception e) {
+                Log.w(TAG, "session.close " + cameraId, e);
+            }
+        }
+
+        if (camera != null) {
+            try {
+                camera.close();
+            } catch (Exception e) {
+                Log.w(TAG, "camera.close " + cameraId, e);
+                releaseClosingSurface(cameraId);
+                synchronized (cameraLock) {
+                    closingIds.remove(cameraId);
+                }
+                openPendingIfAny(cameraId);
+            }
+        } else {
+            releaseClosingSurface(cameraId);
+            synchronized (cameraLock) {
+                closingIds.remove(cameraId);
+            }
+            openPendingIfAny(cameraId);
+        }
         // 保留分辨率设置，避免切换分辨率/重开时被默认值覆盖
     }
 
     public void closeAllCameras() {
+        runOnCameraThread(this::closeAllCamerasInternal);
+    }
+
+    private void closeAllCamerasInternal() {
+        synchronized (cameraLock) {
+            pendingOpens.clear();
+        }
+
         for (CameraCaptureSession session : captureSessions.values()) {
-            session.close();
+            try {
+                session.stopRepeating();
+            } catch (Exception ignored) {
+            }
+            try {
+                session.close();
+            } catch (Exception e) {
+                Log.w(TAG, "closeAllCameras session.close", e);
+            }
         }
         captureSessions.clear();
 
         for (CameraDevice camera : openCameras.values()) {
-            camera.close();
+            try {
+                camera.close();
+            } catch (Exception e) {
+                Log.w(TAG, "closeAllCameras camera.close", e);
+            }
         }
         openCameras.clear();
+
+        for (Surface surface : cameraSurfaces.values()) {
+            try {
+                surface.release();
+            } catch (Exception ignored) {
+            }
+        }
         cameraSurfaces.clear();
+
+        for (Surface surface : closingSurfaces.values()) {
+            try {
+                surface.release();
+            } catch (Exception ignored) {
+            }
+        }
+        closingSurfaces.clear();
+
+        synchronized (cameraLock) {
+            closingIds.clear();
+        }
     }
 
     public int getOpenCameraCount() {

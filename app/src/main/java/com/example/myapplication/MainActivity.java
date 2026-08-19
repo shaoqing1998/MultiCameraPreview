@@ -12,7 +12,6 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.InsetDrawable;
 import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.CameraManager;
 import android.opengl.GLSurfaceView;
 import android.os.Bundle;
 import android.util.DisplayMetrics;
@@ -354,102 +353,72 @@ public class MainActivity extends AppCompatActivity
         }
         loadPersistedSettings();
 
-        // 打印每个摄像头所有支持的分辨率
-        for (String id : cameraIds) {
-            Size[] sizes = cameraHelper.getSupportedResolutions(id);
-            StringBuilder sb = new StringBuilder("Camera " + id + " supported sizes (" + (sizes != null ? sizes.length : 0) + "):");
-            if (sizes != null) {
-                for (Size s : sizes) {
-                    sb.append(" ").append(s.getWidth()).append("x").append(s.getHeight());
-                }
-            }
-            Log.d(TAG, sb.toString());
-        }
-
         updateInfoPanel();
         createCameraViews();
+        cameraHelper.prefetchCameraInfo(cameraIds, () -> runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            updateInfoPanel();
+        }));
     }
 
     private void calculateInitialLayouts() {
         int count = cameraIds.length;
         for (int i = 0; i < count; i++) {
             String cameraId = cameraIds[i];
-            float x, y;
-            int w, h;
-
-            Size[] sizes = cameraHelper.getSupportedResolutions(cameraId);
             float aspectRatio = 4f / 3f;
+            Size[] sizes = cameraHelper.getCachedResolutions(cameraId);
             if (sizes != null && sizes.length > 0) {
                 Size defaultSize = selectDefaultResolution(sizes);
                 aspectRatio = (float) defaultSize.getWidth() / defaultSize.getHeight();
             }
 
+            int cellW;
+            int cellH;
+            int col;
+            int row;
             switch (count) {
                 case 1:
-                    if ((float) (screenWidth - MARGIN * 2) / (screenHeight - MARGIN * 2) > aspectRatio) {
-                        h = screenHeight - MARGIN * 2;
-                        w = (int) (h * aspectRatio);
-                    } else {
-                        w = screenWidth - MARGIN * 2;
-                        h = (int) (w / aspectRatio);
-                    }
-                    x = (screenWidth - w) / 2f;
-                    y = (screenHeight - h) / 2f;
+                    cellW = screenWidth - MARGIN * 2;
+                    cellH = screenHeight - MARGIN * 2;
+                    col = 0;
+                    row = 0;
                     break;
-
                 case 2:
-                    int maxW = (screenWidth - MARGIN * 3) / 2;
-                    int maxH = screenHeight - MARGIN * 2;
-                    if ((float) maxW / maxH > aspectRatio) {
-                        h = maxH;
-                        w = (int) (h * aspectRatio);
-                    } else {
-                        w = maxW;
-                        h = (int) (w / aspectRatio);
-                    }
-                    x = MARGIN + i * (maxW + MARGIN) + (maxW - w) / 2f;
-                    y = MARGIN + (maxH - h) / 2f;
+                    cellW = (screenWidth - MARGIN * 3) / 2;
+                    cellH = screenHeight - MARGIN * 2;
+                    col = i;
+                    row = 0;
                     break;
-
                 case 3:
-                    int maxW3 = (screenWidth - MARGIN * 3) / 2;
-                    int maxH3 = (screenHeight - MARGIN * 3) / 2;
-                    if ((float) maxW3 / maxH3 > aspectRatio) {
-                        h = maxH3;
-                        w = (int) (h * aspectRatio);
-                    } else {
-                        w = maxW3;
-                        h = (int) (w / aspectRatio);
-                    }
-                    if (i < 2) {
-                        x = MARGIN + i * (maxW3 + MARGIN) + (maxW3 - w) / 2f;
-                        y = MARGIN + (maxH3 - h) / 2f;
-                    } else {
-                        x = MARGIN + (maxW3 - w) / 2f;
-                        y = maxH3 + MARGIN * 2 + (maxH3 - h) / 2f;
-                    }
+                    cellW = (screenWidth - MARGIN * 3) / 2;
+                    cellH = (screenHeight - MARGIN * 3) / 2;
+                    col = i < 2 ? i : 0;
+                    row = i < 2 ? 0 : 1;
                     break;
-
                 default:
-                    int maxW4 = (screenWidth - MARGIN * 3) / 2;
-                    int maxH4 = (screenHeight - MARGIN * 3) / 2;
+                    cellW = (screenWidth - MARGIN * 3) / 2;
+                    cellH = (screenHeight - MARGIN * 3) / 2;
                     if (count > 4) {
-                        maxW4 = 320;
-                        maxH4 = 280;
+                        cellW = 320;
+                        cellH = 280;
                     }
-                    if ((float) maxW4 / maxH4 > aspectRatio) {
-                        h = maxH4;
-                        w = (int) (h * aspectRatio);
-                    } else {
-                        w = maxW4;
-                        h = (int) (w / aspectRatio);
-                    }
-                    int col = i % 2;
-                    int row = i / 2;
-                    x = MARGIN + col * (maxW4 + MARGIN) + (maxW4 - w) / 2f;
-                    y = MARGIN + row * (maxH4 + MARGIN) + (maxH4 - h) / 2f;
+                    col = i % 2;
+                    row = i / 2;
                     break;
             }
+
+            int w;
+            int h;
+            if ((float) cellW / cellH > aspectRatio) {
+                h = cellH;
+                w = (int) (h * aspectRatio);
+            } else {
+                w = cellW;
+                h = (int) (w / aspectRatio);
+            }
+
+            float x = MARGIN + col * (cellW + MARGIN);
+            float y = MARGIN + row * (cellH + MARGIN);
 
             CameraState st = savedStates.get(cameraId);
             if (st == null) {
@@ -559,12 +528,6 @@ public class MainActivity extends AppCompatActivity
                         }
                         cameraHelper.clearResolution(cameraId);
 
-                        if (CameraIcReader.isHdmiCamera(cameraId)) {
-                            Size res = cameraHelper.selectResolutionForHdmi(cameraId);
-                            cameraHelper.setResolution(cameraId, res);
-                            Log.d(TAG, "IC changed: pre-set HDMI resolution " + res);
-                        }
-
                         addCameraView(cameraId);
                     }
 
@@ -636,10 +599,7 @@ public class MainActivity extends AppCompatActivity
         infoContent.addView(countView);
 
         try {
-            CameraManager manager = (CameraManager) getSystemService(CAMERA_SERVICE);
-
             for (String id : cameraIds) {
-                CameraCharacteristics chars = manager.getCameraCharacteristics(id);
                 int color = themeColorFor(id);
 
                 LinearLayout camContainer = new LinearLayout(this);
@@ -761,13 +721,14 @@ public class MainActivity extends AppCompatActivity
                     camContainer.addView(hintText);
                 }
 
-                Integer facing = chars.get(CameraCharacteristics.LENS_FACING);
-                String facingStr = facing == CameraCharacteristics.LENS_FACING_FRONT ? "前置" :
+                Integer facing = cameraHelper.getCachedLensFacing(id);
+                String facingStr = facing == null ? "读取中..." :
+                        facing == CameraCharacteristics.LENS_FACING_FRONT ? "前置" :
                         facing == CameraCharacteristics.LENS_FACING_BACK ? "后置" : "外置";
                 addInfoRow(camContainer, "朝向: " + facingStr);
 
-                Size[] sizes = cameraHelper.getSupportedResolutions(id);
-                addInfoRow(camContainer, "分辨率: " + sizes.length + " 种");
+                Size[] sizes = cameraHelper.getCachedResolutions(id);
+                addInfoRow(camContainer, "分辨率: " + (sizes != null ? sizes.length + " 种" : "读取中..."));
 
                 if (CameraIcReader.needsDeinterlace(id)) {
                     TextView deinterlaceBtn = new TextView(this);
@@ -1442,7 +1403,11 @@ public class MainActivity extends AppCompatActivity
         GLSurfaceView glView = frame.getGLSurfaceView();
         if (renderer == null || glView == null) return;
 
-        cameraHelper.closeCamera(cameraId);
+        try {
+            cameraHelper.closeCamera(cameraId);
+        } catch (Exception e) {
+            Log.e(TAG, "closeCamera deinterlace " + cameraId, e);
+        }
         cameraHelper.setResolution(cameraId, newSize);
 
         SurfaceTexture surfaceTexture = renderer.getSurfaceTexture();
@@ -1742,12 +1707,8 @@ public class MainActivity extends AppCompatActivity
         frame.setOnFullscreenChangeListener(this);
 
         CameraState state = savedStates.get(cameraId);
-        // IC 类型检测优先于 savedState，确保切换 IC 后分辨率正确
-        if (CameraIcReader.isHdmiCamera(cameraId)) {
-            Size hdmiRes = cameraHelper.selectResolutionForHdmi(cameraId);
-            cameraHelper.setResolution(cameraId, hdmiRes);
-            Log.d(TAG, "HDMI Camera " + cameraId + " using resolution: " + hdmiRes);
-        } else if (state != null && state.resolution != null && !isLegacy360Resolution(state.resolution)) {
+        if (state != null && state.resolution != null && !isLegacy360Resolution(state.resolution)
+                && !CameraIcReader.isHdmiCamera(cameraId)) {
             cameraHelper.setResolution(cameraId, state.resolution);
         }
 
@@ -1792,11 +1753,11 @@ public class MainActivity extends AppCompatActivity
 
         } else {
             frame.getTextureView().setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+                private boolean firstFrame;
                 @Override
                 public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surface, int w, int h) {
                     cameraHelper.openCamera(cameraId, surface, w, h);
                     frame.setCurrentResolution(cameraHelper.getCurrentResolution(cameraId));
-                    frame.hideLoading();
                 }
                 @Override
                 public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture s, int w, int h) {}
@@ -1805,7 +1766,12 @@ public class MainActivity extends AppCompatActivity
                     return true;
                 }
                 @Override
-                public void onSurfaceTextureUpdated(@NonNull SurfaceTexture s) {}
+                public void onSurfaceTextureUpdated(@NonNull SurfaceTexture s) {
+                    if (!firstFrame) {
+                        firstFrame = true;
+                        frame.hideLoading();
+                    }
+                }
             });
         }
 
@@ -1837,12 +1803,12 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void bindGlCamera(CameraFrame frame, String cameraId) {
+        frame.setOnFirstFrameListener(frame::hideLoading);
         frame.setSurfaceReadyListener(surfaceTexture -> {
             GLSurfaceView glView = frame.getGLSurfaceView();
             if (glView != null) {
                 cameraHelper.openCamera(cameraId, surfaceTexture, glView.getWidth(), glView.getHeight());
                 frame.setCurrentResolution(cameraHelper.getCurrentResolution(cameraId));
-                frame.hideLoading();
             }
         });
     }
@@ -1853,8 +1819,12 @@ public class MainActivity extends AppCompatActivity
             if (!cameraEnabled.getOrDefault(id, false)) continue;
             if (CameraIcReader.needsDeinterlace(id)) continue;
             if (cameraFrames.containsKey(id)) {
-                removeCameraView(id);
-                addCameraView(id);
+                try {
+                    removeCameraView(id);
+                    addCameraView(id);
+                } catch (Exception e) {
+                    Log.e(TAG, "recreate OpenGL camera " + id, e);
+                }
             }
         }
     }
@@ -1890,8 +1860,16 @@ public class MainActivity extends AppCompatActivity
         CameraFrame frame = cameraFrames.remove(cameraId);
         if (frame != null) {
             captureFrameState(cameraId, frame);
-            cameraHelper.closeCamera(cameraId);
-            frame.release();
+            try {
+                cameraHelper.closeCamera(cameraId);
+            } catch (Exception e) {
+                Log.e(TAG, "closeCamera " + cameraId, e);
+            }
+            try {
+                frame.release();
+            } catch (Exception e) {
+                Log.e(TAG, "frame.release " + cameraId, e);
+            }
             container.removeView(frame);
 
             if (cameraId.equals(fullscreenCameraId)) {
@@ -1904,7 +1882,11 @@ public class MainActivity extends AppCompatActivity
     @Override
     public void onResolutionChange(String cameraId, Size newResolution) {
         cameraHelper.setResolution(cameraId, newResolution);
-        cameraHelper.closeCamera(cameraId);
+        try {
+            cameraHelper.closeCamera(cameraId);
+        } catch (Exception e) {
+            Log.e(TAG, "closeCamera on resolution change " + cameraId, e);
+        }
 
         CameraFrame frame = cameraFrames.get(cameraId);
         if (frame != null) {
@@ -1926,8 +1908,11 @@ public class MainActivity extends AppCompatActivity
             } else {
                 TextureView tv = frame.getTextureView();
                 if (tv != null && tv.isAvailable()) {
-                    cameraHelper.openCamera(cameraId, tv.getSurfaceTexture(), tv.getWidth(), tv.getHeight());
-                    frame.setCurrentResolution(newResolution);
+                    SurfaceTexture st = tv.getSurfaceTexture();
+                    if (st != null) {
+                        cameraHelper.openCamera(cameraId, st, tv.getWidth(), tv.getHeight());
+                        frame.setCurrentResolution(newResolution);
+                    }
                 }
             }
         }
@@ -1974,8 +1959,10 @@ public class MainActivity extends AppCompatActivity
                 } else {
                     TextureView tv = frame.getTextureView();
                     if (tv != null && tv.isAvailable()) {
-                        cameraHelper.openCamera(cameraId, tv.getSurfaceTexture(),
-                                tv.getWidth(), tv.getHeight());
+                        SurfaceTexture st = tv.getSurfaceTexture();
+                        if (st != null) {
+                            cameraHelper.openCamera(cameraId, st, tv.getWidth(), tv.getHeight());
+                        }
                     }
                 }
             }
@@ -1986,7 +1973,11 @@ public class MainActivity extends AppCompatActivity
     protected void onDestroy() {
         super.onDestroy();
         for (CameraFrame frame : cameraFrames.values()) {
-            frame.release();
+            try {
+                frame.release();
+            } catch (Exception e) {
+                Log.e(TAG, "frame.release onDestroy", e);
+            }
         }
         cameraFrames.clear();
     }
